@@ -34,3 +34,7 @@ reel_output/video/*
 *.pt
 *.h5
 *.pkl
+# API Keys - NEVER commit these
+key.txt
+*.key
+secrets.txt
