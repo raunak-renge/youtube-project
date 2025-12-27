@@ -10,3 +10,27 @@ google-console
 .idea/
 .vscode/
 *.log
+reel_output/*
+reel_output/video/*
+
+# Media files
+*.wav
+*.mp3
+*.mp4
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+
+# Model files (large)
+*.onnx
+*.bin
+*.pth
+*.pt
+*.h5
+*.pkl

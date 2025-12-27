@@ -1221,8 +1221,10 @@ class VoiceGenerator:
     def _find_bin(self) -> str:
         """Find kokoro-tts binary"""
         paths = [
-            "/Users/sutirthachakraborty/Library/Python/3.11/bin/kokoro-tts",
+            "/opt/anaconda3/envs/youtube-env/bin/kokoro-tts",
+            str(Config.BASE_DIR / "venv" / "bin" / "kokoro-tts"),
             "/opt/homebrew/bin/kokoro-tts",
+            "/usr/local/bin/kokoro-tts",
         ]
         for p in paths:
             if Path(p).exists():
@@ -2488,11 +2490,16 @@ Examples:
                        help="Whisper model size for transcription (default: base)")
     
     # YouTube upload options
-    parser.add_argument("--upload", "-u", action="store_true", help="Auto-upload to YouTube after creation")
+    parser.add_argument("--upload", "-u", action="store_true", default=True, help="Auto-upload to YouTube after creation (default: True)")
+    parser.add_argument("--no-upload", action="store_true", help="Disable auto-upload to YouTube")
     parser.add_argument("--upload-pending", action="store_true", help="Upload all pending videos")
     parser.add_argument("--list-pending", action="store_true", help="List all pending (not uploaded) videos")
     
     args = parser.parse_args()
+    
+    # Handle --no-upload flag
+    if args.no_upload:
+        args.upload = False
     
     # Update config if specified
     Config.OLLAMA_MODEL = args.model
