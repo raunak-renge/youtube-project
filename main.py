@@ -1060,62 +1060,82 @@ def expand_abbreviations_for_tts(text: str) -> str:
 # VIRAL SCRIPT FRAMEWORK (Single Gemini API Call)
 # ============================================================================
 
-VIRAL_SCRIPT_PROMPT = '''You are a viral video script writer and SEO expert. Create a complete {duration}-second short video script for: "{topic}"
+VIRAL_SCRIPT_PROMPT = '''You are a viral video script writer and SEO expert. Create a complete {duration}-second informative short video script for: "{topic}"
 
 Generate ALL content in a SINGLE response including: script, image search keywords, SEO title, description, and tags.
 
 CRITICAL RULES:
-1. First segment MUST be a hook (pattern interrupt, curiosity gap, or bold claim)
-2. Last segment MUST loop back naturally - when video replays, it flows into the hook again
-3. Each segment: 2-3 sentences, conversational tone, 8-10 seconds of speech each
-4. Include specific numbers/facts for credibility
-5. Create curiosity gaps between segments
-6. Start the video with "Do you know... "
+1. INFORMATIVE CONTENT: Pack the video with valuable facts, insights, and actionable information
+2. HOOK (First segment): Must grab attention with a surprising fact, bold question, or shocking statement
+3. BODY (Middle segments): Deliver core information with specific data, examples, and insights
+4. LOOP (Last segment): Must flow naturally back to the hook when video replays - creates seamless loop
+5. Each segment: 2-3 sentences, conversational but informative tone, 8-10 seconds of speech
+6. Include specific numbers, statistics, dates, and facts for credibility
+7. Build curiosity throughout - each segment should make viewers want to keep watching
+8. END WITH CALL-TO-ACTION: Final segment must include "Like, share, and subscribe to Buzz Today for more!"
 
 DURATION GUIDE:
-- 30 seconds = 5-6 segments, ~75 words total
-- 45 seconds = 7-8 segments, ~110 words total  
-- 60 seconds = 9-10 segments, ~150 words total
+- 30 seconds = 5-6 segments, ~75 words total (including CTA)
+- 45 seconds = 7-8 segments, ~110 words total (including CTA)
+- 60 seconds = 9-10 segments, ~150 words total (including CTA)
 - Each segment: 12-18 words (2-3 sentences)
 - Speaking rate: 2.5 words per second
+- LAST segment must be ~15 words: information + "Like, share, and subscribe to Buzz Today for more!"
+
+CONTENT STRUCTURE:
+Segment 1: HOOK - Attention-grabbing opener
+Segments 2-N: INFORMATION - Key facts, data, insights, explanations
+Segment N: LOOP + CTA - Connects to hook + channel promotion
 
 TEXT RULES (for TTS):
 - NO EMOJIS in "text" field - spoken by TTS
 - Write numbers fully: "100 billion dollars" NOT "$100B"
 - Write "50 percent" NOT "50%"
 - No abbreviations: "year over year" NOT "YoY"
-- Natural spoken language
-- Substantial segments (2-3 sentences each)
+- Natural spoken language with informative depth
+- Substantial segments (2-3 sentences each with real information)
 
 PEXELS VIDEO/IMAGE KEYWORD RULES:
 - Used for PEXELS stock video/image search - keep SIMPLE!
 - 2-3 words MAXIMUM per keyword
 - Use COMMON, GENERIC stock footage terms
 - For PERSON topics: Use generic descriptions, NOT names (Pexels has no celebrities)
-- GOOD EXAMPLES: "bitcoin trading", "money cash", "city skyline", "person thinking", "ocean waves", "tech office", "stock market", "running athlete"
+- GOOD EXAMPLES: "bitcoin trading", "money cash", "city skyline", "person thinking", "ocean waves", "tech office", "stock market", "running athlete", "data charts", "world map"
 - BAD EXAMPLES: "cristiano ronaldo" (no celebrities), "abstract success" (too vague), "financial growth chart 2024" (too specific)
 
 YOUTUBE SEO RULES:
-- video_title: Max 100 chars, include emojis + #shorts #viral hashtags
-- description: 100-150 words, SEO-friendly with keywords
-- hashtags_text: 450-500 chars, mix of niche + trending tags
+- video_title: Max 100 chars, include emojis + #shorts #viral #BuzzToday hashtags
+- description: 150-200 words, SEO-friendly with keywords, include "Subscribe to Buzz Today for daily viral content!"
+- hashtags_text: 450-500 chars, mix of niche + trending tags, MUST include #BuzzToday
 
 OUTPUT FORMAT (strict JSON only):
 {{
   "title": "Internal title",
-  "video_title": "SEO YouTube title with emojis #shorts #viral (max 100 chars)",
-  "description": "2-3 sentence SEO description (100-150 words)",
+  "video_title": "SEO YouTube title with emojis #shorts #viral #BuzzToday (max 100 chars)",
+  "description": "3-4 sentence SEO description with keywords and value proposition. End with: 'Subscribe to Buzz Today for daily viral content and fascinating facts!' (150-200 words)",
   "segments": [
     {{
-      "text": "Spoken narration (natural language)",
+      "text": "Spoken narration (natural, informative language with facts/data)",
       "image_keyword": "2-3 word Pexels search term (simple, generic)",
       "emotion": "curious/serious/excited/inspiring/neutral"
+    }},
+    ...
+    {{
+      "text": "[Final informative point]. Like, share, and subscribe to Buzz Today for more!",
+      "image_keyword": "2-3 word Pexels term",
+      "emotion": "inspiring/excited"
     }}
   ],
-  "hashtags_text": "450-500 chars of hashtags",
+  "hashtags_text": "450-500 chars of hashtags including #BuzzToday #shorts #viral",
   "uploaded": false,
   "visibility": "public"
 }}
+
+EXAMPLE FINAL SEGMENT (60 sec video):
+"This trend is reshaping entire industries as we speak. Like, share, and subscribe to Buzz Today for more!"
+
+REMEMBER: Every video must end with the Buzz Today call-to-action!
+'''
 
 Generate the complete script for "{topic}" ({duration} seconds):'''
 
@@ -1858,7 +1878,7 @@ class VideoComposer:
     
     def __init__(self):
         self.ken_burns = KenBurnsEffect()
-        self.transcriber = WordTranscriber(model_size="base")  # Use base for speed
+        self.transcriber = WordTranscriber(model_size="turbo")  # Use turbo for speed
         self.captions = AnimatedCaptions()
     
     def create_video(self, segments: List[Dict], images: List[Path], 
@@ -2650,12 +2670,12 @@ class ReelDesigner:
         if not voice:
             voice = Config.TTS_VOICE
         
-        # Generate the reel
-        self.create_reel(topic, duration, voice)
+        # Generate the reel (with auto-upload enabled by default)
+        self.create_reel(topic, duration, voice, auto_upload=True)
     
     def create_reel(self, topic: str, duration: int = 45, 
                     voice: str = None, add_captions: bool = True,
-                    whisper_model: str = "base", auto_upload: bool = False) -> Path:
+                    whisper_model: str = "base", auto_upload: bool = True) -> Path:
         """Create a complete reel from topic to video with word-by-word captions"""
         voice = voice or Config.TTS_VOICE
         
@@ -2879,9 +2899,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py                           # Interactive mode
-  python main.py -t "Bitcoin investing"    # Create reel for topic
-  python main.py -t "Elon Musk" --upload   # Create and auto-upload
+  python main.py                           # Interactive mode (auto-uploads)
+  python main.py -t "Bitcoin investing"    # Create reel (auto-uploads)
+  python main.py -t "Elon Musk" --no-upload # Create without uploading
   python main.py --upload-pending          # Upload all pending videos
   python main.py --list-pending            # List pending uploads
 
@@ -2893,21 +2913,19 @@ Note: Requires Gemini API key in key.txt file (format: geminikey="YOUR_API_KEY")
     parser.add_argument("--voice", "-v", type=str, default=Config.TTS_VOICE, help="Kokoro TTS voice name (e.g., af_bella, af_nicole)")
     parser.add_argument("--speed", "-s", type=float, default=Config.TTS_SPEED, help="TTS speech speed (default: 1.0)")
     parser.add_argument("--no-captions", action="store_true", help="Disable word-by-word captions")
-    parser.add_argument("--whisper-model", type=str, default="base", 
+    parser.add_argument("--whisper-model", type=str, default="turbo", 
                        choices=["tiny", "base", "small", "medium", "large"],
-                       help="Whisper model size for transcription (default: base)")
+                       help="Whisper model size for transcription (default: turbo)")
     
     # YouTube upload options
-    parser.add_argument("--upload", "-u", action="store_true", default=True, help="Auto-upload to YouTube after creation (default: True)")
-    parser.add_argument("--no-upload", action="store_true", help="Disable auto-upload to YouTube")
+    parser.add_argument("--no-upload", action="store_true", help="Disable auto-upload to YouTube (default: auto-upload enabled)")
     parser.add_argument("--upload-pending", action="store_true", help="Upload all pending videos")
     parser.add_argument("--list-pending", action="store_true", help="List all pending (not uploaded) videos")
     
     args = parser.parse_args()
     
-    # Handle --no-upload flag
-    if args.no_upload:
-        args.upload = False
+    # Auto-upload by default, unless --no-upload is specified
+    args.upload = not args.no_upload
     
     # Update config if specified
     Config.TTS_SPEED = args.speed
