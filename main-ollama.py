@@ -3,9 +3,9 @@
 Interactive Reel Shorts Designer
 ================================
 Creates viral short-form video content using:
-- Gemini AI for script generation (single API call)
+- Ollama for AI script generation
 - Bing Image Crawler for visuals
-- Kokoro TTS for voice synthesis
+- IndexTTS2 for voice synthesis
 - MoviePy for video compilation with Ken Burns effects
 """
 
@@ -36,7 +36,6 @@ def install_packages():
         "google-auth-oauthlib",
         "google-auth-httplib2",
         "google-api-python-client",
-        "google-generativeai",
     ]
     for pkg in packages:
         try:
@@ -51,8 +50,6 @@ def install_packages():
                 pkg_import = "google_auth_httplib2"
             elif pkg == "google-auth":
                 pkg_import = "google.auth"
-            elif pkg == "google-generativeai":
-                pkg_import = "google.genai"
             __import__(pkg_import)
         except ImportError:
             print(f"Installing {pkg}...")
@@ -72,8 +69,7 @@ from PIL import Image, ImageDraw, ImageFont
 import requests
 import whisper
 # MoviePy 2.x API
-from moviepy.video.VideoClip import ImageClip, VideoClip, TextClip, ColorClip
-from moviepy.video.io.VideoFileClip import VideoFileClip
+from moviepy.video.VideoClip import ImageClip, VideoClip, TextClip
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip, concatenate_videoclips
 from icrawler.builtin import BingImageCrawler
@@ -85,52 +81,6 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
-
-# Gemini AI for script generation
-from google import genai
-
-
-# ============================================================================
-# API KEY LOADERS
-# ============================================================================
-
-def load_gemini_api_key() -> str:
-    """Load Gemini API key from key.txt file"""
-    key_file = Path(__file__).parent / "key.txt"
-    if not key_file.exists():
-        raise FileNotFoundError(f"API key file not found: {key_file}")
-    
-    with open(key_file, 'r') as f:
-        content = f.read()
-    
-    # Parse geminikey="..." format
-    match = re.search(r'geminikey\s*=\s*["\']([^"\']+)["\']', content)
-    if match:
-        return match.group(1)
-    
-    # Try direct key format
-    key = content.strip()
-    if key.startswith('AIza'):
-        return key
-    
-    raise ValueError("Could not find valid Gemini API key in key.txt")
-
-
-def load_pexels_api_key() -> str:
-    """Load Pexels API key from key.txt file"""
-    key_file = Path(__file__).parent / "key.txt"
-    if not key_file.exists():
-        raise FileNotFoundError(f"API key file not found: {key_file}")
-    
-    with open(key_file, 'r') as f:
-        content = f.read()
-    
-    # Parse pexelkey="..." format
-    match = re.search(r'pexel(?:s)?key\s*=\s*["\']([^"\']+)["\']', content)
-    if match:
-        return match.group(1)
-    
-    raise ValueError("Could not find valid Pexels API key in key.txt")
 
 
 # ============================================================================
@@ -165,8 +115,9 @@ class Config:
     ZOOM_RANGE = (1.0, 1.3)  # Zoom from 100% to 130%
     PAN_RANGE = 0.15  # Max 15% pan in any direction
     
-    # Gemini AI settings
-    GEMINI_MODEL = "gemini-2.0-flash"
+    # Ollama settings
+    OLLAMA_URL = "http://localhost:11434"
+    OLLAMA_MODEL = "qwen3:8b"
     
     # Audio levels
     MUSIC_VOLUME = 0.12  # Background music volume
@@ -518,214 +469,6 @@ class SmartImageSelector:
 
 
 # ============================================================================
-# PEXELS API CLIENT (Videos & Photos)
-# ============================================================================
-
-class PexelsClient:
-    """Client for Pexels API - Videos first, then Photos fallback"""
-    
-    VIDEO_API_URL = "https://api.pexels.com/videos/search"
-    PHOTO_API_URL = "https://api.pexels.com/v1/search"
-    
-    def __init__(self, output_dir: Path = None):
-        self.output_dir = output_dir or Config.IMAGES_DIR
-        self._api_key = None
-        self._initialized = False
-    
-    def initialize(self) -> bool:
-        """Initialize Pexels client with API key"""
-        if self._initialized:
-            return True
-        
-        try:
-            self._api_key = load_pexels_api_key()
-            self._initialized = True
-            print("  ✓ Pexels API initialized")
-            return True
-        except Exception as e:
-            print(f"  ✗ Pexels initialization failed: {e}")
-            return False
-    
-    def _get_headers(self) -> Dict[str, str]:
-        """Get authorization headers"""
-        return {"Authorization": self._api_key}
-    
-    def search_videos(self, query: str, per_page: int = 3, orientation: str = "portrait") -> List[Dict]:
-        """
-        Search for videos on Pexels.
-        Returns list of video info with download URLs.
-        """
-        if not self.initialize():
-            return []
-        
-        try:
-            params = {
-                "query": query,
-                "orientation": orientation,
-                "per_page": per_page,
-                "size": "medium"  # medium quality for faster downloads
-            }
-            
-            response = requests.get(
-                self.VIDEO_API_URL,
-                headers=self._get_headers(),
-                params=params,
-                timeout=15
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                videos = []
-                
-                for video in data.get("videos", []):
-                    # Get the best quality HD file with portrait dimensions
-                    video_files = video.get("video_files", [])
-                    best_file = None
-                    
-                    # Prefer HD quality, portrait orientation
-                    for vf in video_files:
-                        # Check for portrait orientation (height > width)
-                        if vf.get("height", 0) > vf.get("width", 0):
-                            if vf.get("quality") == "hd" or best_file is None:
-                                best_file = vf
-                    
-                    # Fallback to any HD file if no portrait found
-                    if not best_file:
-                        for vf in video_files:
-                            if vf.get("quality") == "hd":
-                                best_file = vf
-                                break
-                    
-                    # Fallback to first file
-                    if not best_file and video_files:
-                        best_file = video_files[0]
-                    
-                    if best_file:
-                        videos.append({
-                            "id": video.get("id"),
-                            "url": best_file.get("link"),
-                            "width": best_file.get("width"),
-                            "height": best_file.get("height"),
-                            "duration": video.get("duration"),
-                            "quality": best_file.get("quality")
-                        })
-                
-                return videos
-            else:
-                print(f"    Pexels video search failed: {response.status_code}")
-                return []
-                
-        except Exception as e:
-            print(f"    Pexels video search error: {e}")
-            return []
-    
-    def search_photos(self, query: str, per_page: int = 5, orientation: str = "portrait") -> List[Dict]:
-        """
-        Search for photos on Pexels.
-        Returns list of photo info with download URLs.
-        """
-        if not self.initialize():
-            return []
-        
-        try:
-            params = {
-                "query": query,
-                "orientation": orientation,
-                "per_page": per_page,
-                "size": "large"
-            }
-            
-            response = requests.get(
-                self.PHOTO_API_URL,
-                headers=self._get_headers(),
-                params=params,
-                timeout=15
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                photos = []
-                
-                for photo in data.get("photos", []):
-                    src = photo.get("src", {})
-                    photos.append({
-                        "id": photo.get("id"),
-                        "url": src.get("large2x") or src.get("large") or src.get("original"),
-                        "width": photo.get("width"),
-                        "height": photo.get("height")
-                    })
-                
-                return photos
-            else:
-                print(f"    Pexels photo search failed: {response.status_code}")
-                return []
-                
-        except Exception as e:
-            print(f"    Pexels photo search error: {e}")
-            return []
-    
-    def download_video(self, url: str, output_path: Path) -> Optional[Path]:
-        """Download a video from URL"""
-        try:
-            response = requests.get(url, stream=True, timeout=60)
-            if response.status_code == 200:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(output_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                return output_path
-        except Exception as e:
-            print(f"    Download error: {e}")
-        return None
-    
-    def download_photo(self, url: str, output_path: Path) -> Optional[Path]:
-        """Download a photo from URL"""
-        try:
-            response = requests.get(url, timeout=30)
-            if response.status_code == 200:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(output_path, 'wb') as f:
-                    f.write(response.content)
-                return output_path
-        except Exception as e:
-            print(f"    Download error: {e}")
-        return None
-    
-    def trim_video_to_duration(self, video_path: Path, duration: float, output_path: Path = None) -> Optional[Path]:
-        """
-        Trim video to specified duration using ffmpeg.
-        Returns path to trimmed video.
-        """
-        if not video_path.exists():
-            return None
-        
-        output_path = output_path or video_path.parent / f"trimmed_{video_path.name}"
-        
-        try:
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", str(video_path),
-                "-t", str(duration),
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-an",  # Remove audio from stock video
-                str(output_path)
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, timeout=120)
-            
-            if result.returncode == 0 and output_path.exists():
-                return output_path
-            else:
-                print(f"    FFmpeg trim error: {result.stderr.decode()[:200]}")
-                return None
-                
-        except Exception as e:
-            print(f"    Video trim error: {e}")
-            return None
-
-
-# ============================================================================
 # ANIMATED TEXT OVERLAY (Smart Phrase Captions - Like TikTok/Reels)
 # ============================================================================
 
@@ -1057,12 +800,10 @@ def expand_abbreviations_for_tts(text: str) -> str:
 
 
 # ============================================================================
-# VIRAL SCRIPT FRAMEWORK (Single Gemini API Call)
+# VIRAL SCRIPT FRAMEWORK
 # ============================================================================
 
-VIRAL_SCRIPT_PROMPT = '''You are a viral video script writer and SEO expert. Create a complete {duration}-second short video script for: "{topic}"
-
-Generate ALL content in a SINGLE response including: script, image search keywords, SEO title, description, and tags.
+VIRAL_SCRIPT_PROMPT = '''Create a viral {duration}-second short video script for: "{topic}"
 
 CRITICAL RULES:
 1. First segment MUST be a hook (pattern interrupt, curiosity gap, or bold claim)
@@ -1070,132 +811,195 @@ CRITICAL RULES:
 3. Each segment: 2-3 sentences, conversational tone, 8-10 seconds of speech each
 4. Include specific numbers/facts for credibility
 5. Create curiosity gaps between segments
-6. Start the video with "Do you know... "
+6. Start the video with the statement "Do you know... "
 
-DURATION GUIDE:
+DURATION GUIDE (IMPORTANT - generate enough content!):
 - 30 seconds = 5-6 segments, ~75 words total
 - 45 seconds = 7-8 segments, ~110 words total  
 - 60 seconds = 9-10 segments, ~150 words total
-- Each segment: 12-18 words (2-3 sentences)
-- Speaking rate: 2.5 words per second
+- Each segment should have 12-18 words (2-3 sentences)
+- Average speaking rate: 2.5 words per second
 
-TEXT RULES (for TTS):
-- NO EMOJIS in "text" field - spoken by TTS
+TEXT RULES (for TTS narration):
+- NO EMOJIS in "text" field - this is spoken by TTS!
 - Write numbers fully: "100 billion dollars" NOT "$100B"
 - Write "50 percent" NOT "50%"
-- No abbreviations: "year over year" NOT "YoY"
-- Natural spoken language
-- Substantial segments (2-3 sentences each)
+- Avoid abbreviations: "year over year" NOT "YoY"
+- Use natural spoken language
+- Make each segment substantial (2-3 sentences, not just one short sentence)
 
-PEXELS VIDEO/IMAGE KEYWORD RULES:
-- Used for PEXELS stock video/image search - keep SIMPLE!
-- 2-3 words MAXIMUM per keyword
-- Use COMMON, GENERIC stock footage terms
-- For PERSON topics: Use generic descriptions, NOT names (Pexels has no celebrities)
-- GOOD EXAMPLES: "bitcoin trading", "money cash", "city skyline", "person thinking", "ocean waves", "tech office", "stock market", "running athlete"
-- BAD EXAMPLES: "cristiano ronaldo" (no celebrities), "abstract success" (too vague), "financial growth chart 2024" (too specific)
+IMAGE KEYWORD RULES:
+- Keywords are used for Bing/Google IMAGE SEARCH
+- If topic is about a PERSON/CELEBRITY, ALWAYS include their NAME in keywords
+- Use COMMON, SEARCHABLE terms that return good stock photos
+- Be GENERIC enough to find quality images, but relevant to the topic
+- AVOID: Technical jargon, specific charts, abstract concepts
+- GOOD for person topics: "cristiano ronaldo football", "elon musk tesla", "taylor swift concert"
+- GOOD for general: "person counting money", "gold bars stack", "businessman thinking"
+- BAD: "inflation hedge visualization", "silver price spike chart", "abstract success"
+- Think: "What photo would a stock photo site have?"
+- **IMPORTANT**: For person-based topics, include the person's name in EVERY image keyword
 
-YOUTUBE SEO RULES:
-- video_title: Max 100 chars, include emojis + #shorts #viral hashtags
-- description: 100-150 words, SEO-friendly with keywords
-- hashtags_text: 450-500 chars, mix of niche + trending tags
+YOUTUBE SEO METADATA RULES:
+- video_title: SEO-optimized with hashtags (e.g., "Ronaldo's Secret Salary 💰 #shorts #football #cr7 #viral")
+- Must include #shorts at the end for YouTube Shorts algorithm
+- Include relevant trending hashtags: #viral #trending #fyp #tiktok etc.
+- description: 2-3 sentences (100-150 words) SEO-friendly, include main keywords
+- hashtags_text: 450-500 characters total, comma-separated hashtags for copy-paste without '#' symbol
+- Include mix of: niche tags, broad tags, trending tags
+- uploaded: false (status tracking)
+- visibility: "public" (or "private"/"unlisted")
 
-OUTPUT FORMAT (strict JSON only):
+SEGMENT STRUCTURE:
+- Segment 1: HOOK (attention grabber)
+- Segments 2-4: Value/Story (setup → conflict → payoff)
+- Last Segment: LOOP CLOSER (teases back to start, creates rewatch urge)
+
+EXAMPLE OUTPUT for "silver investing" (45-second script, 7 segments):
 {{
-  "title": "Internal title",
-  "video_title": "SEO YouTube title with emojis #shorts #viral (max 100 chars)",
-  "description": "2-3 sentence SEO description (100-150 words)",
+  "title": "Silver Investment Strategy",
+  "video_title": "Why Silver Is About To EXPLODE 🚀 #shorts #silver #investing #money #viral",
+  "description": "Discover the shocking reason why silver prices are skyrocketing right now! China's massive silver purchases are driving prices up 50%% year over year. Smart investors are using this precious metal to hedge against inflation. Don't miss out on this incredible opportunity!",
   "segments": [
-    {{
-      "text": "Spoken narration (natural language)",
-      "image_keyword": "2-3 word Pexels search term (simple, generic)",
-      "emotion": "curious/serious/excited/inspiring/neutral"
-    }}
+    {{"text": "Do you know there is a precious metal that has outperformed gold for two straight years? And most investors have no idea.", "image_keyword": "silver coins pile", "emotion": "curious"}},
+    {{"text": "China just bought 30 percent more silver than last year. They are stockpiling it like there is no tomorrow.", "image_keyword": "china flag money", "emotion": "serious"}},
+    {{"text": "Here is what makes this interesting. Silver is not just a precious metal, it is essential for electronics and solar panels.", "image_keyword": "silver industrial use", "emotion": "serious"}},
+    {{"text": "This dual demand is driving prices up 50 percent year over year. And supply simply cannot keep up.", "image_keyword": "gold silver bars", "emotion": "excited"}},
+    {{"text": "Smart investors have already figured this out. They are using silver to hedge against inflation and currency collapse.", "image_keyword": "investor analyzing stocks", "emotion": "inspiring"}},
+    {{"text": "The question is, will you get in before the masses? Or will you watch from the sidelines?", "image_keyword": "person thinking decision", "emotion": "curious"}},
+    {{"text": "But here is the part nobody wants you to know. Do you know what silver could be worth next year?", "image_keyword": "secret document mystery", "emotion": "curious"}}
   ],
-  "hashtags_text": "450-500 chars of hashtags",
+  "hashtags_text": "#silver #silverinvesting #preciousmetals #investing #finance #money #wealth #silverstack #silverbullion #investingtips #financialfreedom #stockmarket #crypto #gold #goldinvesting #inflation #economy #trading #investor #passiveincome #makemoney #financetips #wealthbuilding #invest #investments #stocks #forex #bitcoin #entrepreneur #business #shorts #viral #trending #fyp #foryou #tiktok #reels #youtube",
   "uploaded": false,
   "visibility": "public"
 }}
 
-Generate the complete script for "{topic}" ({duration} seconds):'''
+EXAMPLE OUTPUT for "Cristiano Ronaldo" (45-second script, 7 segments with person's name):
+{{
+  "title": "Ronaldo's Insane Net Worth",
+  "video_title": "Ronaldo's Salary Can Buy A COUNTRY?! 🤯 #shorts #ronaldo #football #cr7 #viral",
+  "description": "Ever wondered how much Cristiano Ronaldo really makes? His salary from football alone is 100 million euros annually, but his brand deals add another 500 million euros yearly! Discover the shocking truth about CR7's massive wealth and income sources. You won't believe these numbers!",
+  "segments": [
+    {{"text": "Do you know Cristiano Ronaldo makes more money than some entire countries? His income is absolutely insane.", "image_keyword": "cristiano ronaldo football", "emotion": "curious"}},
+    {{"text": "Ronaldo earns 100 million euros annually from football alone. But that is just his base salary.", "image_keyword": "ronaldo playing soccer", "emotion": "serious"}},
+    {{"text": "What most people do not realize is his sponsorship deals. Nike pays him 20 million euros per year just to wear their shoes.", "image_keyword": "ronaldo nike sponsorship", "emotion": "excited"}},
+    {{"text": "His brand deals add another 500 million euros yearly. That includes Nike, Clear, and his own CR7 brand.", "image_keyword": "ronaldo sponsor deal", "emotion": "excited"}},
+    {{"text": "He even makes 3 million dollars per Instagram post. That is more than most people earn in a lifetime.", "image_keyword": "ronaldo instagram social media", "emotion": "serious"}},
+    {{"text": "With all his investments, Ronaldo's net worth is over 1 billion dollars. He is one of the richest athletes ever.", "image_keyword": "cristiano ronaldo luxury wealthy", "emotion": "inspiring"}},
+    {{"text": "So the real question is, do you know how much Ronaldo will be worth by 2030?", "image_keyword": "cristiano ronaldo portrait", "emotion": "curious"}}
+  ],
+  "hashtags_text": "#cristianoronaldo #ronaldo #cr7 #football #soccer #footballplayer #soccerplayer #messi #neymar #sports #fifa #championsleague #premierleague #realmadrid #manchester #juventus #portugal #goat #footballskills #goals #salary #networth #wealth #rich #money #millionaire #billionaire #celebrity #famous #athlete #sports #inspiration #motivation #success #shorts #viral #trending #fyp #foryou #tiktok #reels #youtube #explore",
+  "uploaded": false,
+  "visibility": "public"
+}}
+
+OUTPUT FORMAT (strict JSON only, no other text):
+{{
+  "title": "Internal title for organization",
+  "video_title": "SEO YouTube title with emojis and hashtags #shorts",
+  "description": "2-3 sentence SEO description with keywords (100-150 words)",
+  "segments": [
+    {{"text": "Spoken narration (natural language, no abbreviations)", "image_keyword": "simple searchable image terms", "emotion": "serious/excited/neutral/inspiring/curious"}}
+  ],
+  "hashtags_text": "450-500 chars of space-separated hashtags for copy-paste",
+  "uploaded": false,
+  "visibility": "public"
+}}
+
+Generate script now (follow DURATION GUIDE above for segment count, {duration} seconds total):'''
+
+
+IMAGE_KEYWORDS_PROMPT = '''Generate a simple Bing IMAGE SEARCH keyword (2-5 words).
+
+Narration: "{text}"
+Topic: "{topic}"
+
+RULES:
+- If the topic is about a SPECIFIC PERSON/CELEBRITY, INCLUDE THEIR NAME in the keyword
+- Use common words that return good stock photos
+- Avoid technical/abstract terms
+- Think "what photo exists on stock sites?"
+- GOOD for person: "cristiano ronaldo playing", "elon musk speaking", "taylor swift stage"
+- GOOD for general: "person working laptop", "money cash pile", "city skyline night"
+- BAD: "productivity optimization", "financial growth chart", "abstract success"
+
+Return ONLY the search keyword:'''
 
 
 # ============================================================================
-# GEMINI AI CLIENT
+# OLLAMA CLIENT
 # ============================================================================
 
-class GeminiClient:
-    """Client for interacting with Google Gemini AI API (new google.genai package)"""
+class OllamaClient:
+    """Client for interacting with Ollama API"""
     
-    def __init__(self, model: str = None):
-        self.model_name = model or Config.GEMINI_MODEL
-        self._client = None
-        self._initialized = False
-    
-    def initialize(self) -> bool:
-        """Initialize Gemini with API key"""
-        if self._initialized:
-            return True
-        
-        try:
-            api_key = load_gemini_api_key()
-            self._client = genai.Client(api_key=api_key)
-            self._initialized = True
-            print(f"  ✓ Gemini AI initialized ({self.model_name})")
-            return True
-        except Exception as e:
-            print(f"  ✗ Gemini initialization failed: {e}")
-            return False
+    def __init__(self, base_url: str = Config.OLLAMA_URL, model: str = Config.OLLAMA_MODEL):
+        self.base_url = base_url
+        self.model = model
     
     def check_connection(self) -> bool:
-        """Check if Gemini is properly configured"""
-        return self.initialize()
+        """Check if Ollama is running"""
+        try:
+            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            return response.status_code == 200
+        except:
+            return False
+    
+    def list_models(self) -> List[str]:
+        """List available models"""
+        try:
+            response = requests.get(f"{self.base_url}/api/tags", timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return [m["name"] for m in data.get("models", [])]
+        except:
+            pass
+        return []
     
     def generate(self, prompt: str, temperature: float = 0.7) -> str:
-        """Generate text using Gemini"""
-        if not self.initialize():
-            return ""
-        
+        """Generate text using Ollama"""
         try:
-            response = self._client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config={
-                    "temperature": temperature,
-                    "max_output_tokens": 4096,
-                }
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": temperature,
+                        "num_predict": 2000
+                    }
+                },
+                timeout=300  # 5 minutes timeout for complex prompts
             )
-            
-            if response and response.text:
-                return response.text
+            if response.status_code == 200:
+                return response.json().get("response", "")
         except Exception as e:
-            print(f"Gemini error: {e}")
+            print(f"Ollama error: {e}")
         return ""
 
 
 # ============================================================================
-# SCRIPT GENERATOR (Gemini - Single API Call)
+# SCRIPT GENERATOR
 # ============================================================================
 
 class ScriptGenerator:
-    """Generate viral video scripts using Gemini AI in a single API call"""
+    """Generate viral video scripts using Ollama"""
     
-    def __init__(self, gemini: GeminiClient):
-        self.gemini = gemini
+    def __init__(self, ollama: OllamaClient):
+        self.ollama = ollama
     
     def generate_script(self, topic: str, duration: int = 45, max_retries: int = 3) -> Dict:
-        """Generate a complete viral script in a single Gemini API call"""
+        """Generate a viral script for the given topic with retry logic"""
         prompt = VIRAL_SCRIPT_PROMPT.format(topic=topic, duration=duration)
         
-        print("\n🎬 Generating viral script with Gemini AI (single API call)...")
-        print(f"   📝 Topic: {topic}")
-        print(f"   ⏱️  Duration: {duration} seconds")
+        print("\n🎬 Generating viral script...")
         
         for attempt in range(max_retries):
             if attempt > 0:
                 print(f"   🔄 Retry attempt {attempt + 1}/{max_retries}...")
             
-            response = self.gemini.generate(prompt, temperature=0.7 + (attempt * 0.1))
+            response = self.ollama.generate(prompt, temperature=0.7 + (attempt * 0.1))
             
             if not response:
                 continue
@@ -1207,6 +1011,7 @@ class ScriptGenerator:
                 if json_match:
                     json_str = json_match.group()
                     # Fix common JSON issues
+                    json_str = json_str.replace('\n', ' ')
                     json_str = re.sub(r',\s*}', '}', json_str)  # Remove trailing commas
                     json_str = re.sub(r',\s*]', ']', json_str)
                     
@@ -1222,7 +1027,7 @@ class ScriptGenerator:
                         if 'hashtags_text' not in script_data:
                             script_data['hashtags_text'] = self._generate_default_hashtags(topic)
                         
-                        print(f"✅ Generated {len(script_data['segments'])} segments with SEO metadata")
+                        print(f"✅ Generated {len(script_data['segments'])} segments")
                         return script_data
                         
             except json.JSONDecodeError as e:
@@ -1298,227 +1103,108 @@ class ScriptGenerator:
             "uploaded": False,
             "visibility": "public"
         }
+    
+    def enhance_image_keywords(self, script: Dict, topic: str) -> Dict:
+        """Enhance image search keywords for each segment"""
+        print("\n🖼️  Optimizing image search keywords...")
+        
+        for segment in script.get("segments", []):
+            prompt = IMAGE_KEYWORDS_PROMPT.format(
+                text=segment["text"],
+                topic=topic
+            )
+            keyword = self.ollama.generate(prompt, temperature=0.5).strip()
+            if keyword and len(keyword) < 50:
+                segment["image_keyword"] = keyword
+        
+        return script
 
 
 # ============================================================================
-# MEDIA DOWNLOADER (Pexels Videos → Pexels Photos → Bing Images)
+# IMAGE CRAWLER
 # ============================================================================
 
-class MediaDownloader:
-    """
-    Download media for segments: Pexels videos first, then photos, then Bing images.
-    Each segment gets its own video/image trimmed to audio duration.
-    """
+class ImageDownloader:
+    """Download images from Bing with smart selection for vertical videos"""
     
     def __init__(self, output_dir: Path = Config.IMAGES_DIR):
         self.output_dir = output_dir
-        self.pexels = PexelsClient(output_dir)
         self.smart_selector = SmartImageSelector()
     
-    def download_media_for_segments(
-        self, 
-        segments: List[Dict], 
-        audio_durations: List[float] = None
-    ) -> Dict[str, Dict]:
+    def download_images(self, keywords: List[str], images_per_keyword: int = 5) -> Dict[str, List[Path]]:
         """
-        Download media for each segment.
-        Priority: Pexels Video → Pexels Photo → Bing Image
-        
-        Returns dict with keyword -> {type, path, duration} info
+        Download images for each keyword.
+        Downloads more images than needed to allow smart selection.
         """
-        print("\n📥 Downloading media (Pexels videos → photos → Bing images)...")
+        print("\n📥 Downloading images from Bing (with smart selection)...")
         
         result = {}
         
-        for i, segment in enumerate(segments):
-            keyword = segment.get("image_keyword", "")
-            duration = audio_durations[i] if audio_durations and i < len(audio_durations) else 8.0
+        for i, keyword in enumerate(keywords):
+            keyword_dir = self.output_dir / f"segment_{i:02d}"
+            keyword_dir.mkdir(parents=True, exist_ok=True)
             
-            segment_dir = self.output_dir / f"segment_{i:02d}"
-            segment_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Clear previous files
-            for f in segment_dir.glob("*"):
+            # Clear previous images
+            for f in keyword_dir.glob("*"):
                 f.unlink()
             
-            print(f"  Segment {i+1}: '{keyword}' (need {duration:.1f}s)")
-            
-            # Try Pexels video first
-            media_info = self._try_pexels_video(keyword, segment_dir, duration)
-            
-            # Fallback to Pexels photo
-            if not media_info:
-                media_info = self._try_pexels_photo(keyword, segment_dir)
-            
-            # Final fallback to Bing image
-            if not media_info:
-                media_info = self._try_bing_image(keyword, segment_dir)
-            
-            if media_info:
-                result[keyword] = media_info
-                print(f"    ✓ Got {media_info['type']}: {media_info['path'].name}")
-            else:
-                result[keyword] = {"type": "none", "path": None}
-                print(f"    ✗ No media found!")
-        
-        return result
-    
-    def _try_pexels_video(self, keyword: str, output_dir: Path, duration: float) -> Optional[Dict]:
-        """Try to download and trim a Pexels video"""
-        print(f"    → Trying Pexels video...")
-        
-        videos = self.pexels.search_videos(keyword, per_page=3, orientation="portrait")
-        
-        if not videos:
-            return None
-        
-        for idx, video in enumerate(videos):
-            video_url = video.get("url")
-            if not video_url:
-                continue
-            
-            # Download video
-            video_path = output_dir / f"video_{idx}.mp4"
-            downloaded = self.pexels.download_video(video_url, video_path)
-            
-            if downloaded and downloaded.exists():
-                # Trim to segment duration
-                trimmed_path = output_dir / f"trimmed_{idx}.mp4"
-                trimmed = self.pexels.trim_video_to_duration(downloaded, duration, trimmed_path)
-                
-                if trimmed and trimmed.exists():
-                    # Clean up original
-                    if downloaded.exists() and downloaded != trimmed:
-                        downloaded.unlink()
-                    
-                    return {
-                        "type": "video",
-                        "path": trimmed,
-                        "duration": duration,
-                        "source": "pexels"
-                    }
-        
-        return None
-    
-    def _try_pexels_photo(self, keyword: str, output_dir: Path) -> Optional[Dict]:
-        """Try to download a Pexels photo"""
-        print(f"    → Trying Pexels photo...")
-        
-        photos = self.pexels.search_photos(keyword, per_page=5, orientation="portrait")
-        
-        if not photos:
-            return None
-        
-        downloaded_photos = []
-        for idx, photo in enumerate(photos):
-            photo_url = photo.get("url")
-            if not photo_url:
-                continue
-            
-            photo_path = output_dir / f"photo_{idx}.jpg"
-            downloaded = self.pexels.download_photo(photo_url, photo_path)
-            
-            if downloaded and downloaded.exists():
-                downloaded_photos.append(downloaded)
-        
-        if downloaded_photos:
-            # Select best photo for 9:16 format
-            best_photo = SmartImageSelector.select_best_image(downloaded_photos)
-            return {
-                "type": "image",
-                "path": best_photo,
-                "source": "pexels"
-            }
-        
-        return None
-    
-    def _try_bing_image(self, keyword: str, output_dir: Path) -> Optional[Dict]:
-        """Fallback to Bing image search"""
-        print(f"    → Falling back to Bing images...")
-        
-        try:
-            # Add portrait/vertical hint
+            # Add "vertical" or "portrait" to search for better results
             enhanced_keyword = f"{keyword} vertical portrait"
+            print(f"  Searching: '{keyword}'...")
             
-            crawler = BingImageCrawler(
-                storage={'root_dir': str(output_dir)},
-                feeder_threads=1,
-                parser_threads=1,
-                downloader_threads=2
-            )
-            crawler.crawl(
-                keyword=enhanced_keyword,
-                max_num=5,
-                min_size=(640, 800)
-            )
-            
-            # Also try original keyword if few results
-            downloaded = list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.png"))
-            if len(downloaded) < 2:
-                crawler.crawl(
-                    keyword=keyword,
-                    max_num=5,
-                    min_size=(640, 480)
+            try:
+                crawler = BingImageCrawler(
+                    storage={'root_dir': str(keyword_dir)},
+                    feeder_threads=1,
+                    parser_threads=1,
+                    downloader_threads=2
                 )
-            
-            downloaded = list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.png"))
-            
-            if downloaded:
-                best_image = SmartImageSelector.select_best_image(downloaded)
-                return {
-                    "type": "image",
-                    "path": best_image,
-                    "source": "bing"
-                }
+                crawler.crawl(
+                    keyword=enhanced_keyword,
+                    max_num=images_per_keyword,
+                    min_size=(640, 800)  # Prefer taller images
+                )
                 
-        except Exception as e:
-            print(f"      Bing error: {e}")
-        
-        return None
-    
-    def get_selected_media(self, media_dict: Dict[str, Dict], segments: List[Dict]) -> List[Dict]:
-        """
-        Get ordered list of media for each segment.
-        Returns list of {type, path, source} dicts matching segment order.
-        """
-        selected = []
-        
-        for segment in segments:
-            keyword = segment.get("image_keyword", "")
-            media_info = media_dict.get(keyword, {"type": "none", "path": None})
-            selected.append(media_info)
-        
-        return selected
-
-
-# Legacy alias for backward compatibility
-class ImageDownloader(MediaDownloader):
-    """Legacy class - use MediaDownloader instead"""
-    
-    def download_images(self, keywords: List[str], images_per_keyword: int = 5) -> Dict[str, List[Path]]:
-        """Legacy method - converts to new format"""
-        segments = [{"image_keyword": kw} for kw in keywords]
-        media_dict = self.download_media_for_segments(segments)
-        
-        # Convert to old format
-        result = {}
-        for keyword in keywords:
-            info = media_dict.get(keyword, {})
-            path = info.get("path")
-            result[keyword] = [path] if path else []
+                # Also try original keyword if we got few results
+                downloaded = list(keyword_dir.glob("*.*"))
+                if len(downloaded) < 2:
+                    crawler.crawl(
+                        keyword=keyword,
+                        max_num=images_per_keyword,
+                        min_size=(640, 480)
+                    )
+                
+                # Collect downloaded images
+                images = list(keyword_dir.glob("*.*"))
+                result[keyword] = images
+                print(f"    ✓ Downloaded {len(result[keyword])} images")
+                
+            except Exception as e:
+                print(f"    ✗ Error: {e}")
+                result[keyword] = []
         
         return result
     
     def select_best_images(self, images_dict: Dict[str, List[Path]], segments: List[Dict]) -> List[Path]:
-        """Legacy method - returns best image for each segment"""
+        """Select the best image for each segment using smart scoring"""
+        print("\n🎯 Selecting best images for 9:16 format...")
         selected = []
-        for segment in segments:
+        
+        for i, segment in enumerate(segments):
             keyword = segment.get("image_keyword", "")
             images = images_dict.get(keyword, [])
+            
+            print(f"    Segment {i+1}: '{keyword[:30]}...'")
+            
             if images:
-                selected.append(images[0])
+                # Use smart selection based on orientation scoring
+                best_image = SmartImageSelector.select_best_image(images)
+                selected.append(best_image)
             else:
+                # Use a fallback or placeholder
+                print(f"      → No images found!")
                 selected.append(None)
+        
         return selected
 
 
@@ -1863,33 +1549,18 @@ class VideoComposer:
     
     def create_video(self, segments: List[Dict], images: List[Path], 
                      audio_files: List[Path], output_path: Path,
-                     add_captions: bool = True, media_types: List[str] = None) -> Path:
-        """
-        Create the final video with word-by-word captions, music, and transition sounds.
-        Supports both video clips (from Pexels) and images.
-        
-        Args:
-            segments: Script segments with text and keywords
-            images: List of media paths (images or videos)
-            audio_files: Audio files for each segment
-            output_path: Output video path
-            add_captions: Whether to add word-by-word captions
-            media_types: List of "video" or "image" for each segment
-        """
+                     add_captions: bool = True) -> Path:
+        """Create the final video with word-by-word captions, music, and transition sounds"""
         print("\n🎥 Composing video with animated captions...")
-        
-        # Default media types to "image" if not provided
-        if media_types is None:
-            media_types = ["image"] * len(images)
         
         clips = []
         durations = []
         all_word_data = []  # Store transcription data for each segment
         
-        for i, (segment, media_path, audio) in enumerate(zip(segments, images, audio_files)):
+        for i, (segment, image, audio) in enumerate(zip(segments, images, audio_files)):
             print(f"  Processing segment {i+1}/{len(segments)}...")
             
-            if media_path is None or audio is None:
+            if image is None or audio is None:
                 continue
             
             # Get audio duration
@@ -1908,18 +1579,11 @@ class VideoComposer:
             else:
                 all_word_data.append([])
             
-            # Create video clip based on media type
-            media_type = media_types[i] if i < len(media_types) else "image"
+            # Create Ken Burns effect on image
+            effect_types = ["zoom_in", "zoom_out", "pan_left", "pan_right"]
+            effect = effect_types[i % len(effect_types)]
             
-            if media_type == "video" and str(media_path).endswith(('.mp4', '.mov', '.avi', '.webm')):
-                # Use stock video clip (already trimmed to duration)
-                print(f"    🎬 Using stock video: {media_path.name}")
-                video_clip = self._create_video_clip(media_path, duration)
-            else:
-                # Use Ken Burns effect on image
-                effect_types = ["zoom_in", "zoom_out", "pan_left", "pan_right"]
-                effect = effect_types[i % len(effect_types)]
-                video_clip = self.ken_burns.create_clip(media_path, duration, effect)
+            video_clip = self.ken_burns.create_clip(image, duration, effect)
             
             # Add word-by-word captions overlay
             if add_captions and all_word_data[-1]:
@@ -2034,66 +1698,6 @@ class VideoComposer:
                 pass
         
         return output_path
-    
-    def _create_video_clip(self, video_path: Path, duration: float) -> VideoClip:
-        """
-        Create a video clip from a stock video file.
-        Resizes and crops to fit 9:16 format.
-        """
-        try:
-            # Load video clip
-            clip = VideoFileClip(str(video_path))
-            
-            # Get original dimensions
-            orig_w, orig_h = clip.size
-            
-            # Calculate target dimensions (9:16)
-            target_w = Config.VIDEO_WIDTH
-            target_h = Config.VIDEO_HEIGHT
-            target_aspect = target_w / target_h
-            clip_aspect = orig_w / orig_h
-            
-            # Resize and crop to fit 9:16
-            if clip_aspect > target_aspect:
-                # Clip is wider - scale by height and crop sides
-                new_h = target_h
-                new_w = int(orig_w * (target_h / orig_h))
-                clip = clip.resized(height=target_h)
-                # Center crop
-                x_center = new_w // 2
-                clip = clip.cropped(x1=x_center - target_w // 2, 
-                                   x2=x_center + target_w // 2,
-                                   y1=0, y2=target_h)
-            else:
-                # Clip is taller or square - scale by width and crop top/bottom
-                new_w = target_w
-                new_h = int(orig_h * (target_w / orig_w))
-                clip = clip.resized(width=target_w)
-                # Favor top portion for faces
-                y_start = int((new_h - target_h) * 0.3)
-                clip = clip.cropped(x1=0, x2=target_w,
-                                   y1=y_start, y2=y_start + target_h)
-            
-            # Trim to exact duration if needed
-            if clip.duration > duration:
-                clip = clip.subclipped(0, duration)
-            elif clip.duration < duration:
-                # Loop video if too short
-                loops_needed = int(duration / clip.duration) + 1
-                clips = [clip] * loops_needed
-                clip = concatenate_videoclips(clips)
-                clip = clip.subclipped(0, duration)
-            
-            # Remove audio from stock video (we use TTS audio)
-            clip = clip.without_audio()
-            
-            return clip
-            
-        except Exception as e:
-            print(f"    ⚠️ Video clip error: {e}")
-            # Fallback: create black frame
-            return ColorClip(size=(Config.VIDEO_WIDTH, Config.VIDEO_HEIGHT), 
-                           color=(0, 0, 0), duration=duration)
     
     def _create_caption_clip(self, words: List[Dict], duration: float) -> VideoClip:
         """Create a transparent video clip with animated word-by-word captions"""
@@ -2585,9 +2189,9 @@ class ReelDesigner:
     
     def __init__(self):
         Config.setup_dirs()
-        self.gemini = GeminiClient()
-        self.script_gen = ScriptGenerator(self.gemini)
-        self.media_dl = MediaDownloader()  # Pexels videos/photos + Bing fallback
+        self.ollama = OllamaClient()
+        self.script_gen = ScriptGenerator(self.ollama)
+        self.image_dl = ImageDownloader()
         self.voice_gen = VoiceGenerator()
         self.composer = VideoComposer()
         self.uploader = YouTubeUploader()
@@ -2596,14 +2200,14 @@ class ReelDesigner:
         """Check if all requirements are met"""
         requirements = {}
         
-        # Check Gemini AI
+        # Check Ollama
         print("\n🔍 Checking requirements...")
-        requirements["gemini"] = self.gemini.check_connection()
-        print(f"  Gemini AI: {'✓' if requirements['gemini'] else '✗'}")
+        requirements["ollama"] = self.ollama.check_connection()
+        print(f"  Ollama: {'✓' if requirements['ollama'] else '✗'}")
         
-        # Check Pexels API
-        requirements["pexels"] = self.media_dl.pexels.initialize()
-        print(f"  Pexels API: {'✓' if requirements['pexels'] else '✗'}")
+        if requirements["ollama"]:
+            models = self.ollama.list_models()
+            print(f"    Available models: {', '.join(models[:5])}")
         
         # Check Kokoro TTS
         requirements["kokoro_tts"] = self.voice_gen.initialize()
@@ -2621,15 +2225,16 @@ class ReelDesigner:
         print("\n" + "="*60)
         print("🎬 INTERACTIVE REEL SHORTS DESIGNER")
         print("="*60)
-        print("  Features: Gemini AI, Pexels Videos/Photos, Kokoro TTS")
+        print("  Features: Kokoro TTS, Background Music, Transition Clicks")
         print("="*60)
         
         # Check requirements
         reqs = self.check_requirements()
         
-        if not reqs["gemini"]:
-            print("\n⚠️  Gemini AI is not configured!")
-            print("   Please ensure key.txt contains valid Gemini API key")
+        if not reqs["ollama"]:
+            print("\n⚠️  Ollama is not running!")
+            print("   Please start Ollama: ollama serve")
+            print(f"   And pull a model: ollama pull {Config.OLLAMA_MODEL}")
             return
         
         # Get topic from user
@@ -2663,21 +2268,19 @@ class ReelDesigner:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_topic = re.sub(r'[^\w\s-]', '', topic).replace(' ', '_')[:30]
         
-        # Video filename (used for both video and JSON)
-        video_base_name = f"reel_{timestamp}_{safe_topic}"
-        
         print("\n" + "="*60)
         print(f"🎬 Creating Reel: {topic}")
         print(f"   📝 Word-by-word captions: {'Enabled' if add_captions else 'Disabled'}")
-        print(f"   🆔 Video ID: {video_base_name}")
+        print(f"   🆔 Video ID: {timestamp}_{safe_topic}")
         print("="*60)
         
         # Update whisper model if captions are enabled
         if add_captions:
             self.composer.transcriber = WordTranscriber(model_size=whisper_model)
         
-        # Step 1: Generate script (single Gemini API call - includes all content)
+        # Step 1: Generate script
         script = self.script_gen.generate_script(topic, duration)
+        script = self.script_gen.enhance_image_keywords(script, topic)
         
         # Add metadata fields
         script['uploaded'] = False
@@ -2687,8 +2290,8 @@ class ReelDesigner:
         script['topic'] = topic
         script['duration_target'] = duration
         
-        # Save script with same name as video (JSON alongside MP4)
-        script_filename = f"{video_base_name}.json"
+        # Save script to separate timestamped file in scripts folder
+        script_filename = f"script_{timestamp}_{safe_topic}.json"
         script_path = Config.SCRIPTS_DIR / script_filename
         
         # Also save to main script.json for backward compatibility
@@ -2729,12 +2332,16 @@ class ReelDesigner:
         else:
             print(f"\n#️⃣  Hashtags: {', '.join(script.get('hashtags', []))}")
         
-        # Step 2: Generate audio for each segment using Kokoro TTS
-        # (Do this BEFORE downloading media so we know durations for video trimming)
+        # Step 2: Download images (with smart selection for 9:16)
+        keywords = [s.get("image_keyword", topic) for s in script.get("segments", [])]
+        images_dict = self.image_dl.download_images(keywords, images_per_keyword=5)
+        selected_images = self.image_dl.select_best_images(images_dict, script.get("segments", []))
+        
+        # Step 3: Generate audio for each segment using Kokoro TTS
+        # Uses sentence-by-sentence generation for natural pauses
         print(f"\n🎤 Generating voice narration with Kokoro TTS (voice: {voice})...")
         print("   Using sentence-by-sentence processing for natural speech flow...")
         audio_files = []
-        audio_durations = []
         
         for i, segment in enumerate(script.get("segments", [])):
             text = segment.get("text", "")
@@ -2754,38 +2361,25 @@ class ReelDesigner:
             if result:
                 audio_files.append(result)
                 audio_duration = self.voice_gen.get_audio_duration(result)
-                audio_durations.append(audio_duration)
                 print(f"    ✓ Duration: {audio_duration:.2f}s")
             else:
                 audio_files.append(None)
-                audio_durations.append(8.0)  # Default duration
-        
-        # Step 3: Download media (Pexels videos → photos → Bing images)
-        # Videos are trimmed to match each segment's audio duration
-        segments_list = script.get("segments", [])
-        media_dict = self.media_dl.download_media_for_segments(segments_list, audio_durations)
-        selected_media = self.media_dl.get_selected_media(media_dict, segments_list)
-        
-        # Extract paths for video composition (supports both videos and images)
-        selected_images = [m.get("path") for m in selected_media]
-        media_types = [m.get("type", "image") for m in selected_media]
         
         # Step 4: Compose video with captions, music and click sounds
-        output_video = Config.VIDEO_DIR / f"{video_base_name}.mp4"
+        output_video = Config.VIDEO_DIR / f"reel_{timestamp}_{safe_topic}.mp4"
         
-        # Filter out None values (keep media_types aligned)
+        # Filter out None values
         valid_data = [
-            (seg, img, aud, mtype) 
-            for seg, img, aud, mtype in zip(script.get("segments", []), selected_images, audio_files, media_types)
+            (seg, img, aud) 
+            for seg, img, aud in zip(script.get("segments", []), selected_images, audio_files)
             if img is not None and aud is not None
         ]
         
         if valid_data:
-            segments, images, audios, valid_media_types = zip(*valid_data)
+            segments, images, audios = zip(*valid_data)
             final_video = self.composer.create_video(
                 list(segments), list(images), list(audios), output_video,
-                add_captions=add_captions,
-                media_types=list(valid_media_types)
+                add_captions=add_captions
             )
             
             # Update script with video file path
@@ -2847,8 +2441,7 @@ class ReelDesigner:
             return []
         
         pending = []
-        # Match both old (script_*) and new (reel_*) naming conventions
-        for script_file in sorted(list(scripts_dir.glob("script_*.json")) + list(scripts_dir.glob("reel_*.json"))):
+        for script_file in sorted(scripts_dir.glob("script_*.json")):
             try:
                 with open(script_file, 'r') as f:
                     script = json.load(f)
@@ -2875,7 +2468,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Interactive Reel Shorts Designer with Gemini AI & YouTube Upload",
+        description="Interactive Reel Shorts Designer with YouTube Upload",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -2884,13 +2477,12 @@ Examples:
   python main.py -t "Elon Musk" --upload   # Create and auto-upload
   python main.py --upload-pending          # Upload all pending videos
   python main.py --list-pending            # List pending uploads
-
-Note: Requires Gemini API key in key.txt file (format: geminikey="YOUR_API_KEY")
         """
     )
     parser.add_argument("--topic", "-t", type=str, help="Topic for the reel")
-    parser.add_argument("--duration", "-d", type=int, default=45, help="Target duration in seconds (30/45/60)")
+    parser.add_argument("--duration", "-d", type=int, default=45, help="Target duration in seconds")
     parser.add_argument("--voice", "-v", type=str, default=Config.TTS_VOICE, help="Kokoro TTS voice name (e.g., af_bella, af_nicole)")
+    parser.add_argument("--model", "-m", type=str, default=Config.OLLAMA_MODEL, help="Ollama model to use")
     parser.add_argument("--speed", "-s", type=float, default=Config.TTS_SPEED, help="TTS speech speed (default: 1.0)")
     parser.add_argument("--no-captions", action="store_true", help="Disable word-by-word captions")
     parser.add_argument("--whisper-model", type=str, default="base", 
@@ -2910,6 +2502,7 @@ Note: Requires Gemini API key in key.txt file (format: geminikey="YOUR_API_KEY")
         args.upload = False
     
     # Update config if specified
+    Config.OLLAMA_MODEL = args.model
     Config.TTS_SPEED = args.speed
     
     designer = ReelDesigner()
