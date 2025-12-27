@@ -1,0 +1,13 @@
+# Core deps used by the script
+icrawler
+moviepy
+numpy
+Pillow
+requests
+scipy
+soundfile
+openai-whisper
+
+# Practical/likely-needed extras (used indirectly or by typical setups)
+ffmpeg-python
+tqdm
