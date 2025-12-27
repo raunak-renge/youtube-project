@@ -32,18 +32,37 @@ def install_packages():
         "scipy",
         "soundfile",
         "openai-whisper",
+        "google-auth",
+        "google-auth-oauthlib",
+        "google-auth-httplib2",
+        "google-api-python-client",
     ]
     for pkg in packages:
         try:
             pkg_import = pkg.replace("-", "_").lower()
             if pkg == "openai-whisper":
                 pkg_import = "whisper"
+            elif pkg == "google-api-python-client":
+                pkg_import = "googleapiclient"
+            elif pkg == "google-auth-oauthlib":
+                pkg_import = "google_auth_oauthlib"
+            elif pkg == "google-auth-httplib2":
+                pkg_import = "google_auth_httplib2"
+            elif pkg == "google-auth":
+                pkg_import = "google.auth"
             __import__(pkg_import)
         except ImportError:
             print(f"Installing {pkg}...")
             subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--break-system-packages", "-q"])
 
 install_packages()
+
+from datetime import datetime
+import glob
+import time
+import pickle
+import http.client
+import httplib2
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -54,6 +73,14 @@ from moviepy.video.VideoClip import ImageClip, VideoClip, TextClip
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip, concatenate_videoclips
 from icrawler.builtin import BingImageCrawler
+
+# Google API imports for YouTube upload
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 
 
 # ============================================================================
@@ -67,6 +94,7 @@ class Config:
     IMAGES_DIR = OUTPUT_DIR / "images"
     AUDIO_DIR = OUTPUT_DIR / "audio"
     VIDEO_DIR = OUTPUT_DIR / "video"
+    SCRIPTS_DIR = OUTPUT_DIR / "scripts"  # Separate scripts folder
     
     # Audio
     MUSIC_DIR = BASE_DIR / "background-sounds" / "music"
@@ -95,10 +123,18 @@ class Config:
     MUSIC_VOLUME = 0.12  # Background music volume
     CLICK_VOLUME = 0.30  # Transition click volume
     
+    # YouTube Upload settings
+    GOOGLE_CONSOLE_DIR = BASE_DIR / "google-console"
+    YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+    YOUTUBE_API_SERVICE_NAME = "youtube"
+    YOUTUBE_API_VERSION = "v3"
+    MAX_TITLE_LENGTH = 100  # YouTube title limit
+    MAX_TAGS_LENGTH = 500  # YouTube tags character limit
+    
     @classmethod
     def setup_dirs(cls):
         """Create output directories"""
-        for d in [cls.OUTPUT_DIR, cls.IMAGES_DIR, cls.AUDIO_DIR, cls.VIDEO_DIR]:
+        for d in [cls.OUTPUT_DIR, cls.IMAGES_DIR, cls.AUDIO_DIR, cls.VIDEO_DIR, cls.SCRIPTS_DIR]:
             d.mkdir(parents=True, exist_ok=True)
     
     @classmethod
@@ -171,19 +207,100 @@ class WordTranscriber:
     def align_with_original(self, whisper_words: List[Dict], original_text: str) -> List[Dict]:
         """
         Align Whisper transcription with original narration text.
-        Uses the timestamps from Whisper but corrects the words from the original text.
-        This ensures captions match exactly what was intended to be spoken.
-        """
-        # Clean and tokenize original text
-        original_words = self._tokenize_text(original_text)
         
-        if not original_words or not whisper_words:
+        ROBUST ALGORITHM:
+        - Keep Whisper's word COUNT and TIMING exactly as-is
+        - Only CORRECT SPELLINGS by finding best matching original word
+        - Never alter the sequence of words
+        - Handle cases where Whisper has more or fewer words than original
+        
+        Returns: List with corrected spellings but original Whisper timestamps
+        """
+        if not whisper_words:
+            return []
+        
+        if not original_text:
             return whisper_words
         
-        # Use dynamic time warping-like alignment
-        aligned = self._dtw_align(whisper_words, original_words)
+        # Tokenize original text
+        original_words = self._tokenize_text(original_text)
+        
+        if not original_words:
+            return whisper_words
+        
+        # Create aligned result - same length as whisper_words
+        aligned = []
+        
+        # Track which original words we've used
+        used_original = [False] * len(original_words)
+        
+        for w_idx, whisper_word in enumerate(whisper_words):
+            whisper_text = whisper_word['word']
+            whisper_norm = self._normalize_word(whisper_text)
+            
+            # Find the best matching original word
+            best_match_idx = -1
+            best_similarity = 0.0
+            
+            # Search in a window around the expected position
+            # Expected position based on proportional mapping
+            expected_pos = int((w_idx / len(whisper_words)) * len(original_words))
+            
+            # Search window: prefer nearby words, but check all if needed
+            search_order = self._get_search_order(expected_pos, len(original_words))
+            
+            for orig_idx in search_order:
+                if used_original[orig_idx]:
+                    continue
+                
+                orig_word = original_words[orig_idx]
+                similarity = self._word_similarity(whisper_text, orig_word)
+                
+                # Prefer exact matches or very high similarity
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match_idx = orig_idx
+                
+                # If we found an exact match, stop searching
+                if similarity >= 0.95:
+                    break
+            
+            # Determine which word to use
+            if best_match_idx >= 0 and best_similarity >= 0.4:
+                # Good match found - use original spelling with Whisper timing
+                corrected_word = original_words[best_match_idx]
+                used_original[best_match_idx] = True
+            else:
+                # No good match - keep Whisper's word as-is
+                corrected_word = whisper_text
+            
+            aligned.append({
+                'word': corrected_word,
+                'start': whisper_word['start'],
+                'end': whisper_word['end']
+            })
         
         return aligned
+    
+    def _get_search_order(self, expected_pos: int, total_len: int) -> List[int]:
+        """
+        Generate search order starting from expected position, expanding outward.
+        This prioritizes finding matches near the expected position.
+        """
+        order = []
+        # Start at expected position, then alternate left and right
+        left = expected_pos
+        right = expected_pos + 1
+        
+        while left >= 0 or right < total_len:
+            if left >= 0:
+                order.append(left)
+                left -= 1
+            if right < total_len:
+                order.append(right)
+                right += 1
+        
+        return order
     
     def _tokenize_text(self, text: str) -> List[str]:
         """Tokenize text into words, preserving punctuation attached to words"""
@@ -203,108 +320,52 @@ class WordTranscriber:
         return re.sub(r'[^\w\s]', '', word.lower()).strip()
     
     def _word_similarity(self, word1: str, word2: str) -> float:
-        """Calculate similarity between two words (0 to 1)"""
+        """
+        Calculate similarity between two words (0 to 1).
+        Uses multiple methods for robust matching.
+        """
         w1 = self._normalize_word(word1)
         w2 = self._normalize_word(word2)
         
+        # Exact match
         if w1 == w2:
             return 1.0
         
-        # Check if one contains the other
-        if w1 in w2 or w2 in w1:
-            return 0.8
-        
-        # Simple character-level similarity (Levenshtein-like)
+        # Empty check
         if not w1 or not w2:
             return 0.0
         
-        # Count matching characters
-        matches = sum(1 for c1, c2 in zip(w1, w2) if c1 == c2)
+        # One contains the other (handles contractions, suffixes)
+        if w1 in w2 or w2 in w1:
+            return 0.85
+        
+        # Same first letter and similar length (likely same word)
+        if w1[0] == w2[0] and abs(len(w1) - len(w2)) <= 2:
+            # Calculate Levenshtein-like ratio
+            matches = sum(1 for c1, c2 in zip(w1, w2) if c1 == c2)
+            max_len = max(len(w1), len(w2))
+            ratio = matches / max_len
+            if ratio >= 0.6:
+                return 0.7 + (ratio * 0.2)
+        
+        # Check for common transcription errors
+        # Numbers: "70,000" vs "seventy thousand"
+        # We'll handle these by checking if both represent numbers
+        
+        # Character-level similarity (Levenshtein ratio approximation)
+        # Count matching characters in order
+        matches = 0
+        j = 0
+        for c in w1:
+            while j < len(w2):
+                if w2[j] == c:
+                    matches += 1
+                    j += 1
+                    break
+                j += 1
+        
         max_len = max(len(w1), len(w2))
         return matches / max_len if max_len > 0 else 0.0
-    
-    def _dtw_align(self, whisper_words: List[Dict], original_words: List[str]) -> List[Dict]:
-        """
-        Align Whisper words with original words using a greedy alignment approach.
-        Returns aligned words with corrected text but Whisper timestamps.
-        """
-        aligned = []
-        whisper_idx = 0
-        original_idx = 0
-        
-        while original_idx < len(original_words) and whisper_idx < len(whisper_words):
-            orig_word = original_words[original_idx]
-            whisper_word = whisper_words[whisper_idx]
-            
-            # Calculate similarity
-            similarity = self._word_similarity(orig_word, whisper_word['word'])
-            
-            if similarity >= 0.5:
-                # Good match - use original word with Whisper timing
-                aligned.append({
-                    'word': orig_word,
-                    'start': whisper_word['start'],
-                    'end': whisper_word['end']
-                })
-                whisper_idx += 1
-                original_idx += 1
-            else:
-                # Check if Whisper skipped a word or added extra word
-                # Look ahead in both sequences
-                next_whisper_sim = 0
-                next_orig_sim = 0
-                
-                if whisper_idx + 1 < len(whisper_words):
-                    next_whisper_sim = self._word_similarity(
-                        orig_word, whisper_words[whisper_idx + 1]['word']
-                    )
-                
-                if original_idx + 1 < len(original_words):
-                    next_orig_sim = self._word_similarity(
-                        original_words[original_idx + 1], whisper_word['word']
-                    )
-                
-                if next_whisper_sim > similarity and next_whisper_sim >= 0.5:
-                    # Whisper has an extra word, skip it
-                    whisper_idx += 1
-                elif next_orig_sim > similarity and next_orig_sim >= 0.5:
-                    # Original has a word Whisper missed, interpolate timing
-                    if aligned:
-                        prev_end = aligned[-1]['end']
-                        next_start = whisper_word['start']
-                        duration = (next_start - prev_end) / 2
-                        aligned.append({
-                            'word': orig_word,
-                            'start': prev_end,
-                            'end': prev_end + duration
-                        })
-                    original_idx += 1
-                else:
-                    # Force alignment with current words
-                    aligned.append({
-                        'word': orig_word,
-                        'start': whisper_word['start'],
-                        'end': whisper_word['end']
-                    })
-                    whisper_idx += 1
-                    original_idx += 1
-        
-        # Handle remaining original words (interpolate timing)
-        if original_idx < len(original_words) and aligned:
-            last_end = aligned[-1]['end']
-            remaining = len(original_words) - original_idx
-            # Estimate duration per word
-            avg_duration = sum(w['end'] - w['start'] for w in aligned) / len(aligned) if aligned else 0.3
-            
-            for i, word in enumerate(original_words[original_idx:]):
-                start = last_end + i * avg_duration
-                aligned.append({
-                    'word': word,
-                    'start': start,
-                    'end': start + avg_duration
-                })
-        
-        return aligned
 
 
 # ============================================================================
@@ -408,34 +469,149 @@ class SmartImageSelector:
 
 
 # ============================================================================
-# ANIMATED TEXT OVERLAY (Single Word Captions - Like TikTok/Reels)
+# ANIMATED TEXT OVERLAY (Smart Phrase Captions - Like TikTok/Reels)
 # ============================================================================
+
+class SmartPhraseGrouper:
+    """
+    Intelligently groups words for captions.
+    - Keeps numbers with their units together ("7 million dollars")
+    - Doesn't show words after punctuation in same frame
+    - Creates natural reading chunks
+    """
+    
+    # Patterns that should be grouped together
+    NUMBER_WORDS = {'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 
+                    'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen',
+                    'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty',
+                    'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety',
+                    'hundred', 'thousand', 'million', 'billion', 'trillion'}
+    
+    UNIT_WORDS = {'dollars', 'euros', 'pounds', 'percent', 'percentage', 'years', 
+                  'months', 'days', 'hours', 'minutes', 'seconds', 'times', 'people',
+                  'users', 'customers', 'followers', 'views', 'likes', 'subscribers'}
+    
+    MAGNITUDE_WORDS = {'thousand', 'million', 'billion', 'trillion', 'hundred'}
+    
+    @staticmethod
+    def group_words_for_display(words: List[Dict]) -> List[Dict]:
+        """
+        Group words intelligently for caption display.
+        Returns list of phrase groups with combined timing.
+        """
+        if not words:
+            return []
+        
+        grouped = []
+        i = 0
+        
+        while i < len(words):
+            word = words[i]
+            word_lower = word['word'].lower().strip()
+            word_clean = re.sub(r'[^\w]', '', word_lower)
+            
+            # Check if this word ends with sentence-ending punctuation
+            ends_sentence = word['word'].rstrip().endswith(('.', '!', '?', '…', '...'))
+            
+            # Check if this is a number or starts a number phrase
+            is_number = word_clean.isdigit() or word_clean in SmartPhraseGrouper.NUMBER_WORDS
+            
+            if is_number:
+                # Collect the full number phrase (e.g., "7 million dollars")
+                phrase_words = [word]
+                j = i + 1
+                
+                while j < len(words):
+                    next_word = words[j]
+                    next_lower = next_word['word'].lower().strip()
+                    next_clean = re.sub(r'[^\w]', '', next_lower)
+                    
+                    # Check if next word is part of number phrase
+                    is_magnitude = next_clean in SmartPhraseGrouper.MAGNITUDE_WORDS
+                    is_unit = next_clean in SmartPhraseGrouper.UNIT_WORDS
+                    is_num = next_clean.isdigit() or next_clean in SmartPhraseGrouper.NUMBER_WORDS
+                    
+                    if is_magnitude or is_unit or is_num:
+                        phrase_words.append(next_word)
+                        j += 1
+                        # Stop after unit word
+                        if is_unit:
+                            break
+                    else:
+                        break
+                
+                # Create grouped phrase
+                combined_text = ' '.join(w['word'] for w in phrase_words)
+                grouped.append({
+                    'word': combined_text,
+                    'start': phrase_words[0]['start'],
+                    'end': phrase_words[-1]['end'],
+                    'is_phrase': True
+                })
+                i = j
+            else:
+                # Single word - just add it
+                grouped.append({
+                    'word': word['word'],
+                    'start': word['start'],
+                    'end': word['end'],
+                    'is_phrase': False,
+                    'ends_sentence': ends_sentence
+                })
+                i += 1
+        
+        return grouped
+    
+    @staticmethod
+    def should_show_word(current_phrase: Dict, prev_phrase: Optional[Dict], current_time: float) -> bool:
+        """
+        Determine if we should show this phrase at current time.
+        Don't show word immediately after sentence-ending punctuation in same timeframe.
+        """
+        if not current_phrase:
+            return False
+        
+        # Basic timing check
+        if not (current_phrase['start'] <= current_time <= current_phrase['end']):
+            return False
+        
+        # If previous phrase ended a sentence, ensure small gap
+        if prev_phrase and prev_phrase.get('ends_sentence', False):
+            # Add a small visual pause after sentences
+            if current_time < current_phrase['start'] + 0.1:
+                return False
+        
+        return True
+
 
 class AnimatedCaptions:
     """
-    Create beautiful single-word animated captions.
-    Shows ONE word at a time, centered and highlighted in YELLOW.
-    Styled like viral TikTok/Instagram Reels captions.
+    Create beautiful phrase-aware animated captions.
+    Shows ONE word/phrase at a time, centered and highlighted in YELLOW.
+    Keeps numbers with units together for natural reading.
     """
     
     # Text styling - Large, bold, yellow text
-    FONT_SIZE = 96  # Bigger for single word
-    FONT_COLOR = (255, 255, 0)  # Bright Yellow (like the reference image)
+    FONT_SIZE = 90  # Slightly smaller for phrases
+    FONT_COLOR = (255, 255, 0)  # Bright Yellow
     STROKE_COLOR = (0, 0, 0)  # Black outline for readability
-    STROKE_WIDTH = 6  # Thicker stroke for visibility
-    BG_COLOR = (0, 0, 0, 160)  # Semi-transparent black background
+    STROKE_WIDTH = 5  # Thicker stroke for visibility
+    BG_COLOR = (0, 0, 0, 180)  # Semi-transparent black background
     
     # Position (center of screen, lower third area)
-    POSITION_Y_RATIO = 0.70  # 70% from top (lower third)
+    POSITION_Y_RATIO = 0.72  # 72% from top (lower third)
     
     # Animation settings
     PADDING = 30
+    MAX_CHARS = 25  # Max characters before reducing font size
     
     def __init__(self, width: int = Config.VIDEO_WIDTH, height: int = Config.VIDEO_HEIGHT):
         self.width = width
         self.height = height
         self.font = self._load_font()
-        self.small_font = self._load_font(size=48)  # For secondary text if needed
+        self.small_font = self._load_font(size=72)
+        self.phrase_grouper = SmartPhraseGrouper()
+        self._grouped_cache = {}
     
     def _load_font(self, size: int = None) -> ImageFont.FreeTypeFont:
         """Load a bold font for captions"""
@@ -455,43 +631,66 @@ class AnimatedCaptions:
                     continue
         return ImageFont.load_default()
     
+    def _get_grouped_words(self, words: List[Dict]) -> List[Dict]:
+        """Get or create grouped words (cached)"""
+        # Create a simple hash for caching
+        cache_key = len(words)
+        if cache_key not in self._grouped_cache:
+            self._grouped_cache[cache_key] = SmartPhraseGrouper.group_words_for_display(words)
+        return self._grouped_cache[cache_key]
+    
     def create_caption_frame(self, words: List[Dict], current_time: float) -> np.ndarray:
         """
-        Create a transparent frame with a SINGLE highlighted word.
-        Only shows the current word being spoken, centered in yellow.
+        Create a transparent frame with a SINGLE word or phrase.
+        Intelligently groups numbers with units.
         """
         # Create transparent image
         img = Image.new('RGBA', (self.width, self.height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         
-        # Find the current word being spoken
-        current_word = self._get_current_word(words, current_time)
+        # Get grouped words/phrases
+        grouped = self._get_grouped_words(words)
         
-        if not current_word:
+        # Find the current phrase being spoken
+        current_phrase, prev_phrase = self._get_current_phrase(grouped, current_time)
+        
+        if not current_phrase:
             return np.array(img)
         
-        # Draw the single word centered
-        self._draw_single_word(draw, current_word['word'])
+        # Check if we should show this phrase
+        if not SmartPhraseGrouper.should_show_word(current_phrase, prev_phrase, current_time):
+            return np.array(img)
+        
+        # Draw the phrase centered
+        self._draw_phrase(draw, current_phrase['word'])
         
         return np.array(img)
     
-    def _get_current_word(self, words: List[Dict], current_time: float) -> Optional[Dict]:
-        """Get the single word being spoken at current time"""
-        for word in words:
-            # Check if current time falls within this word's timing
-            if word['start'] <= current_time <= word['end']:
-                return word
-        
-        # If between words, show nothing (or could show the last word)
-        return None
+    def _get_current_phrase(self, grouped: List[Dict], current_time: float) -> Tuple[Optional[Dict], Optional[Dict]]:
+        """Get the current phrase and previous phrase at current time"""
+        prev_phrase = None
+        for i, phrase in enumerate(grouped):
+            if phrase['start'] <= current_time <= phrase['end']:
+                prev_phrase = grouped[i-1] if i > 0 else None
+                return phrase, prev_phrase
+            if phrase['start'] > current_time:
+                break
+            prev_phrase = phrase
+        return None, prev_phrase
     
-    def _draw_single_word(self, draw: ImageDraw.Draw, word: str):
-        """Draw a single word centered on screen with yellow highlight"""
-        # Clean the word (remove extra punctuation for display, keep it readable)
-        display_word = word.upper()  # Uppercase for impact (like the reference)
+    def _draw_phrase(self, draw: ImageDraw.Draw, text: str):
+        """Draw a word or phrase centered on screen with yellow highlight"""
+        # Clean and format the text
+        display_text = text.upper().strip()
+        
+        # Remove trailing punctuation for cleaner display (but keep internal)
+        display_text = display_text.rstrip('.,!?;:')
+        
+        # Choose font size based on text length
+        font = self.font if len(display_text) <= self.MAX_CHARS else self.small_font
         
         # Get text dimensions
-        bbox = draw.textbbox((0, 0), display_word, font=self.font)
+        bbox = draw.textbbox((0, 0), display_text, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
         
@@ -500,8 +699,8 @@ class AnimatedCaptions:
         y = int(self.height * self.POSITION_Y_RATIO) - text_height // 2
         
         # Draw background pill/rectangle
-        bg_padding_x = 40
-        bg_padding_y = 20
+        bg_padding_x = 50
+        bg_padding_y = 25
         bg_rect = [
             x - bg_padding_x,
             y - bg_padding_y,
@@ -509,103 +708,222 @@ class AnimatedCaptions:
             y + text_height + bg_padding_y
         ]
         # Rounded rectangle background
-        draw.rounded_rectangle(bg_rect, radius=15, fill=self.BG_COLOR)
+        draw.rounded_rectangle(bg_rect, radius=20, fill=self.BG_COLOR)
         
         # Draw text with stroke (outline) for readability
-        # Draw stroke first (black outline)
         for dx in range(-self.STROKE_WIDTH, self.STROKE_WIDTH + 1):
             for dy in range(-self.STROKE_WIDTH, self.STROKE_WIDTH + 1):
                 if dx != 0 or dy != 0:
-                    draw.text((x + dx, y + dy), display_word, 
-                             font=self.font, fill=self.STROKE_COLOR)
+                    draw.text((x + dx, y + dy), display_text, 
+                             font=font, fill=self.STROKE_COLOR)
         
         # Draw main text in YELLOW
-        draw.text((x, y), display_word, font=self.font, fill=self.FONT_COLOR)
+        draw.text((x, y), display_text, font=font, fill=self.FONT_COLOR)
 
 
 # ============================================================================
-# VIRAL SCRIPT FRAMEWORK (Based on uploaded document)
+# TEXT PREPROCESSING FOR TTS (Expand abbreviations)
 # ============================================================================
 
-VIRAL_SCRIPT_PROMPT = '''You are a viral content creator specializing in short-form video scripts for Instagram Reels and YouTube Shorts.
+def expand_abbreviations_for_tts(text: str) -> str:
+    """
+    Expand abbreviations and symbols for proper TTS pronunciation.
+    Converts $100B → 100 billion dollars, 50% → 50 percent, etc.
+    """
+    import re
+    
+    # Currency with magnitude (must come before simple currency)
+    # $100B, $5M, $2T, etc.
+    def expand_currency_magnitude(match):
+        symbol = match.group(1)
+        number = match.group(2)
+        magnitude = match.group(3).upper()
+        
+        currency = "dollars" if symbol == "$" else "euros" if symbol == "€" else "pounds" if symbol == "£" else "units"
+        magnitudes = {"K": "thousand", "M": "million", "B": "billion", "T": "trillion"}
+        mag_word = magnitudes.get(magnitude, "")
+        
+        return f"{number} {mag_word} {currency}"
+    
+    text = re.sub(r'([$€£])(\d+(?:\.\d+)?)\s*([KkMmBbTt])\b', expand_currency_magnitude, text)
+    
+    # Simple currency ($100, $5.50)
+    text = re.sub(r'\$(\d+(?:\.\d+)?)', r'\1 dollars', text)
+    text = re.sub(r'€(\d+(?:\.\d+)?)', r'\1 euros', text)
+    text = re.sub(r'£(\d+(?:\.\d+)?)', r'\1 pounds', text)
+    
+    # Percentages
+    text = re.sub(r'(\d+(?:\.\d+)?)\s*%', r'\1 percent', text)
+    
+    # Common abbreviations
+    abbreviations = {
+        r'\bYoY\b': 'year over year',
+        r'\bMoM\b': 'month over month',
+        r'\bQoQ\b': 'quarter over quarter',
+        r'\bROI\b': 'return on investment',
+        r'\bGDP\b': 'GDP',
+        r'\bCEO\b': 'CEO',
+        r'\bAI\b': 'AI',
+        r'\bUS\b': 'US',
+        r'\bUK\b': 'UK',
+        r'\bvs\.?\b': 'versus',
+        r'\betc\.?\b': 'etcetera',
+        r'\be\.g\.?\b': 'for example',
+        r'\bi\.e\.?\b': 'that is',
+        r'\bw/\b': 'with',
+        r'\bw/o\b': 'without',
+        r'\b&\b': 'and',
+        r'\bhr\b': 'hour',
+        r'\bhrs\b': 'hours',
+        r'\bmin\b': 'minute',
+        r'\bmins\b': 'minutes',
+        r'\bsec\b': 'second',
+        r'\bsecs\b': 'seconds',
+    }
+    
+    for pattern, replacement in abbreviations.items():
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    
+    # Numbers with K/M/B suffix (not currency)
+    def expand_number_magnitude(match):
+        number = match.group(1)
+        magnitude = match.group(2).upper()
+        magnitudes = {"K": "thousand", "M": "million", "B": "billion", "T": "trillion"}
+        return f"{number} {magnitudes.get(magnitude, '')}"
+    
+    text = re.sub(r'(\d+(?:\.\d+)?)\s*([KkMmBbTt])\b(?![a-zA-Z])', expand_number_magnitude, text)
+    
+    # Clean up multiple spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
 
-Create a highly engaging script for the topic: "{topic}"
 
-FOLLOW THIS EXACT FRAMEWORK:
+# ============================================================================
+# VIRAL SCRIPT FRAMEWORK
+# ============================================================================
 
-1. **HOOK (0-2 seconds)** - Create a pattern interrupt using ONE of these:
-   - Contradiction: "I was doing this wrong for 3 years…"
-   - Big claim: "This is the fastest way to ___ (without ___)."
-   - Curiosity gap: "Nobody talks about the *real* reason ___."
-   - Specific number: "3 mistakes killing your ____."
-   - Relatable pain: "If you feel stuck... watch this."
-   - Cold open action: Start mid-moment
+VIRAL_SCRIPT_PROMPT = '''Create a viral {duration}-second short video script for: "{topic}"
 
-2. **STAKES (1 line)** - Why they should care:
-   - "If you don't fix this, you'll keep ___."
-   - "This saved me ___ (time/money/embarrassment)."
+CRITICAL RULES:
+1. First segment MUST be a hook (pattern interrupt, curiosity gap, or bold claim)
+2. Last segment MUST loop back naturally - when video replays, it flows into the hook again
+3. Each segment: 2-3 sentences, conversational tone, 8-10 seconds of speech each
+4. Include specific numbers/facts for credibility
+5. Create curiosity gaps between segments
+6. Start the video with the statement "Do you know... "
 
-3. **3-BEAT ARC**:
-   - Setup: what's happening (fast)
-   - Conflict: the problem/tension
-   - Payoff: the reveal + result + lesson
+DURATION GUIDE (IMPORTANT - generate enough content!):
+- 30 seconds = 5-6 segments, ~75 words total
+- 45 seconds = 7-8 segments, ~110 words total  
+- 60 seconds = 9-10 segments, ~150 words total
+- Each segment should have 12-18 words (2-3 sentences)
+- Average speaking rate: 2.5 words per second
 
-4. **OPEN LOOPS** - Keep attention:
-   - "In a second, I'll show you..."
-   - "The weirdest part was..."
-   - Reveal every 3-7 seconds
+TEXT RULES (for TTS narration):
+- NO EMOJIS in "text" field - this is spoken by TTS!
+- Write numbers fully: "100 billion dollars" NOT "$100B"
+- Write "50 percent" NOT "50%"
+- Avoid abbreviations: "year over year" NOT "YoY"
+- Use natural spoken language
+- Make each segment substantial (2-3 sentences, not just one short sentence)
 
-5. **PROOF** - Build credibility:
-   - Include a specific number, result, or before-after
+IMAGE KEYWORD RULES:
+- Keywords are used for Bing/Google IMAGE SEARCH
+- If topic is about a PERSON/CELEBRITY, ALWAYS include their NAME in keywords
+- Use COMMON, SEARCHABLE terms that return good stock photos
+- Be GENERIC enough to find quality images, but relevant to the topic
+- AVOID: Technical jargon, specific charts, abstract concepts
+- GOOD for person topics: "cristiano ronaldo football", "elon musk tesla", "taylor swift concert"
+- GOOD for general: "person counting money", "gold bars stack", "businessman thinking"
+- BAD: "inflation hedge visualization", "silver price spike chart", "abstract success"
+- Think: "What photo would a stock photo site have?"
+- **IMPORTANT**: For person-based topics, include the person's name in EVERY image keyword
 
-6. **REPLAY LINE** - Shareable quote:
-   - Something memorable they'll want to rewatch
+YOUTUBE SEO METADATA RULES:
+- video_title: SEO-optimized with hashtags (e.g., "Ronaldo's Secret Salary 💰 #shorts #football #cr7 #viral")
+- Must include #shorts at the end for YouTube Shorts algorithm
+- Include relevant trending hashtags: #viral #trending #fyp #tiktok etc.
+- description: 2-3 sentences (100-150 words) SEO-friendly, include main keywords
+- hashtags_text: 450-500 characters total, comma-separated hashtags for copy-paste without '#' symbol
+- Include mix of: niche tags, broad tags, trending tags
+- uploaded: false (status tracking)
+- visibility: "public" (or "private"/"unlisted")
 
-7. **CTA** - One action:
-   - "Save this for later"
-   - "Comment if you want part 2"
-   - "Follow for more"
+SEGMENT STRUCTURE:
+- Segment 1: HOOK (attention grabber)
+- Segments 2-4: Value/Story (setup → conflict → payoff)
+- Last Segment: LOOP CLOSER (teases back to start, creates rewatch urge)
 
-OUTPUT FORMAT (JSON):
+EXAMPLE OUTPUT for "silver investing" (45-second script, 7 segments):
 {{
-    "title": "Video title for the reel",
-    "hook": "The opening hook line (2-3 seconds spoken)",
-    "segments": [
-        {{
-            "text": "Narration text for this segment",
-            "image_keyword": "Specific image search term for this part",
-            "duration_hint": "short/medium/long",
-            "emotion": "neutral/excited/serious/inspiring"
-        }}
-    ],
-    "cta": "Call to action at the end",
-    "hashtags": ["relevant", "hashtags", "list"],
-    "total_estimated_duration": "30-60 seconds"
+  "title": "Silver Investment Strategy",
+  "video_title": "Why Silver Is About To EXPLODE 🚀 #shorts #silver #investing #money #viral",
+  "description": "Discover the shocking reason why silver prices are skyrocketing right now! China's massive silver purchases are driving prices up 50%% year over year. Smart investors are using this precious metal to hedge against inflation. Don't miss out on this incredible opportunity!",
+  "segments": [
+    {{"text": "Do you know there is a precious metal that has outperformed gold for two straight years? And most investors have no idea.", "image_keyword": "silver coins pile", "emotion": "curious"}},
+    {{"text": "China just bought 30 percent more silver than last year. They are stockpiling it like there is no tomorrow.", "image_keyword": "china flag money", "emotion": "serious"}},
+    {{"text": "Here is what makes this interesting. Silver is not just a precious metal, it is essential for electronics and solar panels.", "image_keyword": "silver industrial use", "emotion": "serious"}},
+    {{"text": "This dual demand is driving prices up 50 percent year over year. And supply simply cannot keep up.", "image_keyword": "gold silver bars", "emotion": "excited"}},
+    {{"text": "Smart investors have already figured this out. They are using silver to hedge against inflation and currency collapse.", "image_keyword": "investor analyzing stocks", "emotion": "inspiring"}},
+    {{"text": "The question is, will you get in before the masses? Or will you watch from the sidelines?", "image_keyword": "person thinking decision", "emotion": "curious"}},
+    {{"text": "But here is the part nobody wants you to know. Do you know what silver could be worth next year?", "image_keyword": "secret document mystery", "emotion": "curious"}}
+  ],
+  "hashtags_text": "#silver #silverinvesting #preciousmetals #investing #finance #money #wealth #silverstack #silverbullion #investingtips #financialfreedom #stockmarket #crypto #gold #goldinvesting #inflation #economy #trading #investor #passiveincome #makemoney #financetips #wealthbuilding #invest #investments #stocks #forex #bitcoin #entrepreneur #business #shorts #viral #trending #fyp #foryou #tiktok #reels #youtube",
+  "uploaded": false,
+  "visibility": "public"
 }}
 
-RULES:
-- Keep each segment to 1-2 short sentences max
-- Make it conversational, not formal
-- Use contrast and specificity
-- Create curiosity gaps
-- Make every line earn the next second
-- Target {duration} second video
+EXAMPLE OUTPUT for "Cristiano Ronaldo" (45-second script, 7 segments with person's name):
+{{
+  "title": "Ronaldo's Insane Net Worth",
+  "video_title": "Ronaldo's Salary Can Buy A COUNTRY?! 🤯 #shorts #ronaldo #football #cr7 #viral",
+  "description": "Ever wondered how much Cristiano Ronaldo really makes? His salary from football alone is 100 million euros annually, but his brand deals add another 500 million euros yearly! Discover the shocking truth about CR7's massive wealth and income sources. You won't believe these numbers!",
+  "segments": [
+    {{"text": "Do you know Cristiano Ronaldo makes more money than some entire countries? His income is absolutely insane.", "image_keyword": "cristiano ronaldo football", "emotion": "curious"}},
+    {{"text": "Ronaldo earns 100 million euros annually from football alone. But that is just his base salary.", "image_keyword": "ronaldo playing soccer", "emotion": "serious"}},
+    {{"text": "What most people do not realize is his sponsorship deals. Nike pays him 20 million euros per year just to wear their shoes.", "image_keyword": "ronaldo nike sponsorship", "emotion": "excited"}},
+    {{"text": "His brand deals add another 500 million euros yearly. That includes Nike, Clear, and his own CR7 brand.", "image_keyword": "ronaldo sponsor deal", "emotion": "excited"}},
+    {{"text": "He even makes 3 million dollars per Instagram post. That is more than most people earn in a lifetime.", "image_keyword": "ronaldo instagram social media", "emotion": "serious"}},
+    {{"text": "With all his investments, Ronaldo's net worth is over 1 billion dollars. He is one of the richest athletes ever.", "image_keyword": "cristiano ronaldo luxury wealthy", "emotion": "inspiring"}},
+    {{"text": "So the real question is, do you know how much Ronaldo will be worth by 2030?", "image_keyword": "cristiano ronaldo portrait", "emotion": "curious"}}
+  ],
+  "hashtags_text": "#cristianoronaldo #ronaldo #cr7 #football #soccer #footballplayer #soccerplayer #messi #neymar #sports #fifa #championsleague #premierleague #realmadrid #manchester #juventus #portugal #goat #footballskills #goals #salary #networth #wealth #rich #money #millionaire #billionaire #celebrity #famous #athlete #sports #inspiration #motivation #success #shorts #viral #trending #fyp #foryou #tiktok #reels #youtube #explore",
+  "uploaded": false,
+  "visibility": "public"
+}}
 
-Generate the script now:'''
+OUTPUT FORMAT (strict JSON only, no other text):
+{{
+  "title": "Internal title for organization",
+  "video_title": "SEO YouTube title with emojis and hashtags #shorts",
+  "description": "2-3 sentence SEO description with keywords (100-150 words)",
+  "segments": [
+    {{"text": "Spoken narration (natural language, no abbreviations)", "image_keyword": "simple searchable image terms", "emotion": "serious/excited/neutral/inspiring/curious"}}
+  ],
+  "hashtags_text": "450-500 chars of space-separated hashtags for copy-paste",
+  "uploaded": false,
+  "visibility": "public"
+}}
+
+Generate script now (follow DURATION GUIDE above for segment count, {duration} seconds total):'''
 
 
-IMAGE_KEYWORDS_PROMPT = '''Based on this video script segment, generate the BEST image search keyword for Bing Images.
+IMAGE_KEYWORDS_PROMPT = '''Generate a simple Bing IMAGE SEARCH keyword (2-5 words).
 
-Segment text: "{text}"
+Narration: "{text}"
 Topic: "{topic}"
 
-Requirements:
-- Keyword should be 2-4 words
-- Should find visually striking, high-quality images
-- Should relate directly to the content
-- Avoid generic terms, be specific
+RULES:
+- If the topic is about a SPECIFIC PERSON/CELEBRITY, INCLUDE THEIR NAME in the keyword
+- Use common words that return good stock photos
+- Avoid technical/abstract terms
+- Think "what photo exists on stock sites?"
+- GOOD for person: "cristiano ronaldo playing", "elon musk speaking", "taylor swift stage"
+- GOOD for general: "person working laptop", "money cash pile", "city skyline night"
+- BAD: "productivity optimization", "financial growth chart", "abstract success"
 
-Return ONLY the search keyword, nothing else.'''
+Return ONLY the search keyword:'''
 
 
 # ============================================================================
@@ -652,7 +970,7 @@ class OllamaClient:
                         "num_predict": 2000
                     }
                 },
-                timeout=120
+                timeout=300  # 5 minutes timeout for complex prompts
             )
             if response.status_code == 200:
                 return response.json().get("response", "")
@@ -671,70 +989,119 @@ class ScriptGenerator:
     def __init__(self, ollama: OllamaClient):
         self.ollama = ollama
     
-    def generate_script(self, topic: str, duration: int = 45) -> Dict:
-        """Generate a viral script for the given topic"""
+    def generate_script(self, topic: str, duration: int = 45, max_retries: int = 3) -> Dict:
+        """Generate a viral script for the given topic with retry logic"""
         prompt = VIRAL_SCRIPT_PROMPT.format(topic=topic, duration=duration)
         
         print("\n🎬 Generating viral script...")
-        response = self.ollama.generate(prompt, temperature=0.8)
         
-        if not response:
-            print("⚠️  Ollama returned empty response, using fallback...")
-            return self._create_fallback_script(topic, "")
+        for attempt in range(max_retries):
+            if attempt > 0:
+                print(f"   🔄 Retry attempt {attempt + 1}/{max_retries}...")
+            
+            response = self.ollama.generate(prompt, temperature=0.7 + (attempt * 0.1))
+            
+            if not response:
+                continue
+            
+            # Extract JSON from response
+            try:
+                # Try to find JSON in the response
+                json_match = re.search(r'\{[\s\S]*\}', response)
+                if json_match:
+                    json_str = json_match.group()
+                    # Fix common JSON issues
+                    json_str = json_str.replace('\n', ' ')
+                    json_str = re.sub(r',\s*}', '}', json_str)  # Remove trailing commas
+                    json_str = re.sub(r',\s*]', ']', json_str)
+                    
+                    script_data = json.loads(json_str)
+                    
+                    # Validate that it has required fields
+                    if "segments" in script_data and len(script_data["segments"]) > 0:
+                        # Ensure all required fields exist
+                        if 'video_title' not in script_data:
+                            script_data['video_title'] = f"{script_data.get('title', topic)} #shorts #viral"
+                        if 'description' not in script_data:
+                            script_data['description'] = f"Discover the truth about {topic}. Watch now!"
+                        if 'hashtags_text' not in script_data:
+                            script_data['hashtags_text'] = self._generate_default_hashtags(topic)
+                        
+                        print(f"✅ Generated {len(script_data['segments'])} segments")
+                        return script_data
+                        
+            except json.JSONDecodeError as e:
+                if attempt == max_retries - 1:
+                    print(f"⚠️  JSON parse error after {max_retries} attempts: {e}")
+                    print(f"   Raw response preview: {response[:200]}...")
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"⚠️  Unexpected error: {e}")
         
-        # Extract JSON from response
-        try:
-            # Try to find JSON in the response
-            json_match = re.search(r'\{[\s\S]*\}', response)
-            if json_match:
-                script_data = json.loads(json_match.group())
-                # Validate that it has required fields
-                if "segments" in script_data and len(script_data["segments"]) > 0:
-                    print(f"✅ Generated {len(script_data['segments'])} segments")
-                    return script_data
-                else:
-                    print("⚠️  JSON missing segments, using fallback...")
-                    return self._create_fallback_script(topic, response)
-        except json.JSONDecodeError as e:
-            print(f"⚠️  JSON parse error: {e}, using fallback...")
-        except Exception as e:
-            print(f"⚠️  Unexpected error: {e}, using fallback...")
+        # All retries failed - use fallback
+        print("⚠️  Using fallback script after failed retries...")
+        return self._create_fallback_script(topic, response if response else "")
+    
+    def _generate_default_hashtags(self, topic: str) -> str:
+        """Generate default hashtags text (450-500 chars)"""
+        base_tags = topic.lower().replace(" ", "").split()[:3]
+        niche_tags = " ".join([f"#{tag}" for tag in base_tags])
         
-        # Fallback: create a simple structure
-        return self._create_fallback_script(topic, response)
+        trending = "#shorts #viral #trending #fyp #foryou #tiktok #reels #youtube #explore #viralvideos #viralshorts"
+        return f"{niche_tags} {trending} #education #learning #facts #knowledge #motivation #inspiration #success #tips #advice #life"
     
     def _create_fallback_script(self, topic: str, raw_response: str) -> Dict:
-        """Create fallback script structure from raw response"""
-        # Try to extract meaningful lines from response
-        lines = [l.strip() for l in raw_response.split('\n') if l.strip() and len(l.strip()) > 10]
+        """Create fallback script structure with loop-back ending and full metadata"""
+        print("   📝 Creating fallback script with generic template...")
         
-        # If we have very few lines, create a default viral script structure
-        if len(lines) < 3:
-            lines = [
-                f"Watch how I mastered {topic}!",
-                f"Most people don't know this about {topic}.",
-                f"Here's the secret to {topic}.",
-                f"This changed everything for me.",
-                f"You can do this too!",
-                f"Save this for later!"
+        # DON'T use raw response as it contains JSON syntax
+        # Create clean, professional script
+        
+        # Detect if topic is a person's name (has multiple words with capital letters)
+        words = topic.split()
+        is_person = len(words) >= 2 and any(w[0].isupper() for w in words if w)
+        
+        if is_person:
+            # Person-focused script (7 segments for ~45 seconds)
+            name = words[0]  # First name
+            segments = [
+                {"text": f"Do you know the incredible story behind {topic}? Most people have never heard this.", "image_keyword": f"{topic} portrait", "emotion": "curious"},
+                {"text": f"{name} is making waves in their field right now. And the world is finally paying attention.", "image_keyword": f"{topic} working", "emotion": "serious"},
+                {"text": f"What most people do not realize is how much sacrifice it took. Years of hard work behind the scenes.", "image_keyword": f"{topic} training", "emotion": "serious"},
+                {"text": f"Their achievements are truly remarkable. Breaking records that no one thought possible.", "image_keyword": f"{topic} success", "emotion": "excited"},
+                {"text": f"This is what sets {name} apart from everyone else. Pure dedication and relentless focus.", "image_keyword": f"{topic} achievement", "emotion": "inspiring"},
+                {"text": f"The question is, can anyone else replicate what they have done? Probably not.", "image_keyword": f"{topic} famous", "emotion": "curious"},
+                {"text": f"But do you really know what makes {topic} so special? The answer might surprise you.", "image_keyword": f"{topic} inspiring", "emotion": "curious"}
             ]
+            title = f"{topic} - Untold Story"
+            video_title = f"{topic}'s Incredible Journey 🌟 #shorts #inspiration #success #viral"
+            description = f"Discover the amazing story of {topic}. Learn about their journey, achievements, and what makes them truly exceptional. You won't believe what they've accomplished!"
+        else:
+            # Topic-focused script (7 segments for ~45 seconds)
+            segments = [
+                {"text": f"Do you know the real secret about {topic}? Most people get this completely wrong.", "image_keyword": f"{topic} explained", "emotion": "curious"},
+                {"text": f"The truth is not what you expect. What you have been told is only half the story.", "image_keyword": f"{topic} facts", "emotion": "serious"},
+                {"text": f"Here is what actually makes a difference. This one insight changes everything.", "image_keyword": f"{topic} tips", "emotion": "excited"},
+                {"text": f"Smart people already figured this out. They use this knowledge to get ahead of everyone else.", "image_keyword": f"{topic} success", "emotion": "inspiring"},
+                {"text": f"The problem is most people never take action. They hear this and then do nothing.", "image_keyword": f"{topic} problem", "emotion": "serious"},
+                {"text": f"Will you be different? Or will you stay stuck like everyone else?", "image_keyword": f"{topic} decision", "emotion": "curious"},
+                {"text": f"But do you really understand {topic}? The answer determines your future.", "image_keyword": f"{topic} knowledge", "emotion": "curious"}
+            ]
+            title = f"{topic.title()} - The Truth"
+            video_title = f"{topic.title()} Explained 🔥 #shorts #viral #trending"
+            description = f"Discover the truth about {topic}! This video reveals what most people don't know. Watch till the end to learn the secrets that can change everything. Don't miss out!"
         
-        segments = []
-        for i, line in enumerate(lines[:6]):  # Max 6 segments
-            segments.append({
-                "text": line[:200],  # Limit length
-                "image_keyword": f"{topic} {['action', 'tutorial', 'result', 'before', 'after', 'success'][i % 6]}",
-                "duration_hint": "medium",
-                "emotion": "neutral"
-            })
+        # Generate comprehensive hashtags
+        hashtags_text = self._generate_default_hashtags(topic)
         
         return {
-            "title": f"🔥 Master {topic} - Viral Tips",
-            "hook": segments[0]["text"] if segments else f"You won't believe this about {topic}...",
+            "title": title,
+            "video_title": video_title,
+            "description": description,
             "segments": segments,
-            "cta": "Follow for more amazing content!",
-            "hashtags": [topic.replace(" ", ""), "viral", "shorts", "reels"],
-            "total_estimated_duration": "30-45 seconds"
+            "hashtags_text": hashtags_text,
+            "uploaded": False,
+            "visibility": "public"
         }
     
     def enhance_image_keywords(self, script: Dict, topic: str) -> Dict:
@@ -932,6 +1299,112 @@ class VoiceGenerator:
             return float(result.stdout.strip())
         except:
             return 3.0  # Default fallback
+    
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """
+        Split text into sentences for natural TTS pauses.
+        Handles multiple sentence-ending punctuation marks.
+        IMPORTANT: Don't split on ellipsis (...) as it's a pause, not sentence end.
+        """
+        # First, protect ellipsis from being split
+        text = text.replace('...', '<<<ELLIPSIS>>>')
+        text = text.replace('…', '<<<ELLIPSIS>>>')
+        
+        # Pattern to split on sentence-ending punctuation followed by space
+        # Only split on . ! ? when followed by a space and capital letter or end
+        sentence_pattern = r'(?<=[.!?])\s+(?=[A-Z])'
+        sentences = re.split(sentence_pattern, text.strip())
+        
+        # Restore ellipsis
+        sentences = [s.replace('<<<ELLIPSIS>>>', '...').strip() for s in sentences]
+        
+        # Filter out empty sentences
+        sentences = [s for s in sentences if s.strip()]
+        
+        # If no split occurred (single sentence), return original
+        if not sentences:
+            return [text.replace('<<<ELLIPSIS>>>', '...')]
+        
+        return sentences
+    
+    def _concatenate_audio_files(self, audio_files: List[Path], output_path: Path) -> Optional[Path]:
+        """
+        Concatenate multiple audio files into one using ffmpeg.
+        """
+        if not audio_files:
+            return None
+        
+        if len(audio_files) == 1:
+            # Just copy the single file
+            import shutil
+            shutil.copy(audio_files[0], output_path)
+            return output_path
+        
+        # Create a temporary file list for ffmpeg
+        list_file = output_path.parent / f"concat_list_{random.randint(1000, 9999)}.txt"
+        try:
+            with open(list_file, 'w') as f:
+                for audio in audio_files:
+                    # Escape single quotes in path
+                    safe_path = str(audio).replace("'", "'\\''")
+                    f.write(f"file '{safe_path}'\n")
+            
+            # Run ffmpeg concat
+            cmd = [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", str(list_file), "-c", "copy", str(output_path)
+            ]
+            result = subprocess.run(cmd, capture_output=True, timeout=120)
+            
+            if result.returncode == 0 and output_path.exists():
+                return output_path
+            else:
+                print(f"    ⚠ Concat failed, using first sentence only")
+                import shutil
+                shutil.copy(audio_files[0], output_path)
+                return output_path
+                
+        except Exception as e:
+            print(f"    ⚠ Concat error: {e}")
+            return None
+        finally:
+            list_file.unlink(missing_ok=True)
+            # Clean up temp sentence files
+            for audio in audio_files:
+                if "_sent_" in str(audio):
+                    audio.unlink(missing_ok=True)
+    
+    def generate_audio_sentence_by_sentence(self, text: str, output_path: Path,
+                                            voice: str = None, emotion: str = "neutral") -> Optional[Path]:
+        """
+        Generate audio sentence by sentence for natural TTS pauses.
+        This prevents the TTS from running sentences together unnaturally.
+        """
+        sentences = self._split_into_sentences(text)
+        
+        # If only one sentence, use regular generation
+        if len(sentences) <= 1:
+            return self.generate_audio(text, output_path, voice, emotion)
+        
+        print(f"      📜 Processing {len(sentences)} sentences...")
+        
+        # Generate audio for each sentence
+        sentence_audios = []
+        for i, sentence in enumerate(sentences):
+            if not sentence.strip():
+                continue
+            
+            sent_path = output_path.parent / f"temp_sent_{output_path.stem}_{i:02d}.wav"
+            result = self.generate_audio(sentence, sent_path, voice, emotion)
+            
+            if result and result.exists():
+                sentence_audios.append(result)
+        
+        if not sentence_audios:
+            return self.generate_audio(text, output_path, voice, emotion)
+        
+        # Concatenate all sentence audios
+        return self._concatenate_audio_files(sentence_audios, output_path)
 
 
 # ============================================================================
@@ -1309,6 +1782,403 @@ class VideoComposer:
 
 
 # ============================================================================
+# YOUTUBE UPLOADER (Multi-credential with failover)
+# ============================================================================
+
+class YouTubeUploader:
+    """
+    YouTube video uploader with multi-credential failover support.
+    Reads OAuth credentials from google-console folder and retries with
+    different credentials if one fails.
+    """
+    
+    # Trending hashtags for Shorts (SEO optimized)
+    TRENDING_HASHTAGS = [
+        "#shorts", "#viral", "#trending", "#fyp", "#foryou", "#tiktok", 
+        "#reels", "#youtube", "#explore", "#viralshorts", "#youtubeshorts"
+    ]
+    
+    # Niche-based SEO tags database
+    SEO_TAGS_DATABASE = {
+        "finance": ["money", "investing", "stocks", "crypto", "wealth", "finance", "millionaire", "passive income", "trading", "entrepreneur"],
+        "motivation": ["motivation", "success", "mindset", "inspiration", "goals", "hustle", "grind", "self improvement", "growth"],
+        "education": ["education", "learning", "facts", "knowledge", "science", "history", "tips", "howto", "tutorial"],
+        "entertainment": ["funny", "comedy", "memes", "entertainment", "lol", "hilarious", "jokes"],
+        "sports": ["sports", "football", "soccer", "basketball", "fitness", "gym", "workout", "athlete"],
+        "tech": ["tech", "technology", "gadgets", "ai", "coding", "software", "innovation", "future"],
+        "lifestyle": ["lifestyle", "life", "daily", "routine", "vlog", "day in my life"],
+        "celebrity": ["celebrity", "famous", "star", "hollywood", "gossip", "news", "breaking"],
+    }
+    
+    def __init__(self):
+        self.credentials_files = self._get_credential_files()
+        self.current_cred_index = 0
+        self.youtube_service = None
+        
+    def _get_credential_files(self) -> List[Path]:
+        """Get all OAuth credential JSON files from google-console folder"""
+        cred_dir = Config.GOOGLE_CONSOLE_DIR
+        if not cred_dir.exists():
+            print(f"⚠️  Google console directory not found: {cred_dir}")
+            return []
+        
+        # Find all client secret JSON files
+        cred_files = list(cred_dir.glob("client_secret*.json"))
+        if not cred_files:
+            # Also try other naming patterns
+            cred_files = list(cred_dir.glob("*.json"))
+            # Filter out token files
+            cred_files = [f for f in cred_files if "token" not in f.name.lower()]
+        
+        print(f"📁 Found {len(cred_files)} credential file(s) in google-console/")
+        return cred_files
+    
+    def _get_authenticated_service(self, cred_file: Path):
+        """Authenticate and return YouTube service using specific credential file"""
+        token_file = Config.GOOGLE_CONSOLE_DIR / f"token_{cred_file.stem}.pickle"
+        creds = None
+        
+        # Load existing token if available
+        if token_file.exists():
+            try:
+                with open(token_file, 'rb') as token:
+                    creds = pickle.load(token)
+            except Exception as e:
+                print(f"   ⚠️ Error loading token: {e}")
+        
+        # Refresh or get new credentials
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                except Exception as e:
+                    print(f"   ⚠️ Token refresh failed: {e}")
+                    creds = None
+            
+            if not creds:
+                try:
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        str(cred_file), 
+                        Config.YOUTUBE_SCOPES
+                    )
+                    creds = flow.run_local_server(port=0)
+                except Exception as e:
+                    print(f"   ❌ Authentication failed: {e}")
+                    return None
+            
+            # Save the credentials for next time
+            with open(token_file, 'wb') as token:
+                pickle.dump(creds, token)
+        
+        # Build YouTube service
+        try:
+            return build(
+                Config.YOUTUBE_API_SERVICE_NAME,
+                Config.YOUTUBE_API_VERSION,
+                credentials=creds
+            )
+        except Exception as e:
+            print(f"   ❌ Failed to build YouTube service: {e}")
+            return None
+    
+    def _optimize_title(self, title: str, topic: str) -> str:
+        """
+        Optimize title for YouTube Shorts SEO.
+        - Max 100 characters
+        - Include #shorts and viral hashtags
+        - Make it catchy and clickable
+        """
+        # Essential hashtags for Shorts algorithm
+        required_tags = " #shorts #viral"
+        
+        # Clean the title
+        title = title.strip()
+        
+        # If title doesn't have hashtags, add them
+        if "#shorts" not in title.lower():
+            # Calculate available space
+            available = Config.MAX_TITLE_LENGTH - len(required_tags)
+            
+            if len(title) > available:
+                # Truncate title smartly (at word boundary)
+                title = title[:available-3].rsplit(' ', 1)[0] + "..."
+            
+            title = title + required_tags
+        else:
+            # Title already has hashtags, just ensure length
+            if len(title) > Config.MAX_TITLE_LENGTH:
+                # Keep hashtags, truncate description part
+                parts = title.rsplit('#', 1)
+                if len(parts) == 2:
+                    desc_part = parts[0][:Config.MAX_TITLE_LENGTH - len('#' + parts[1]) - 3] + "..."
+                    title = desc_part + '#' + parts[1]
+                else:
+                    title = title[:Config.MAX_TITLE_LENGTH-3] + "..."
+        
+        return title[:Config.MAX_TITLE_LENGTH]
+    
+    def _generate_seo_tags(self, topic: str, existing_tags: str = "") -> List[str]:
+        """
+        Generate SEO-optimized tags for YouTube (max 500 characters total).
+        Mix of: topic-specific, niche, trending, and broad reach tags.
+        """
+        tags = []
+        
+        # Parse existing tags if provided
+        if existing_tags:
+            # Remove # symbols and split
+            existing = [t.strip().replace('#', '') for t in existing_tags.replace(',', ' ').split()]
+            tags.extend([t for t in existing if t and len(t) > 1])
+        
+        # Add topic-based tags
+        topic_words = topic.lower().replace('-', ' ').replace('_', ' ').split()
+        tags.extend([w for w in topic_words if len(w) > 2])
+        
+        # Add combined topic tag
+        topic_tag = ''.join(w.capitalize() for w in topic_words[:3])
+        if topic_tag and len(topic_tag) > 2:
+            tags.append(topic_tag)
+        
+        # Detect niche and add relevant tags
+        topic_lower = topic.lower()
+        for niche, niche_tags in self.SEO_TAGS_DATABASE.items():
+            # Check if topic relates to this niche
+            if any(keyword in topic_lower for keyword in niche_tags[:3]):
+                tags.extend(niche_tags)
+        
+        # Add trending Shorts tags (without #)
+        trending = [t.replace('#', '') for t in self.TRENDING_HASHTAGS]
+        tags.extend(trending)
+        
+        # Add broad reach tags
+        broad_tags = [
+            "viral", "trending", "fyp", "foryou", "explore",
+            "viralvideo", "trendingshorts", "youtubeshorts",
+            "shortsvideo", "shortsyoutube", "viralshort"
+        ]
+        tags.extend(broad_tags)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_tags = []
+        for tag in tags:
+            tag_lower = tag.lower().strip()
+            if tag_lower and tag_lower not in seen and len(tag_lower) > 1:
+                seen.add(tag_lower)
+                unique_tags.append(tag)
+        
+        # Trim to fit 500 character limit
+        final_tags = []
+        total_length = 0
+        for tag in unique_tags:
+            # Account for comma separator
+            tag_length = len(tag) + 1
+            if total_length + tag_length <= Config.MAX_TAGS_LENGTH:
+                final_tags.append(tag)
+                total_length += tag_length
+            else:
+                break
+        
+        return final_tags
+    
+    def _generate_description(self, script: Dict, topic: str) -> str:
+        """Generate SEO-optimized description for YouTube"""
+        description = script.get('description', '')
+        
+        if not description:
+            # Generate default description
+            description = f"Discover the truth about {topic}! Watch till the end for a surprising twist. "
+            description += "Don't forget to like, subscribe, and turn on notifications! "
+        
+        # Add hashtags at the end (YouTube shows first 3)
+        hashtags = script.get('hashtags_text', '')
+        if hashtags:
+            # Take first 10 hashtags for description
+            tags_list = hashtags.split()[:10]
+            hashtag_line = ' '.join([f"#{t.replace('#', '')}" for t in tags_list])
+            description += f"\n\n{hashtag_line}"
+        
+        # Add call to action
+        description += "\n\n📌 Follow for more amazing content!"
+        description += "\n💬 Comment what you want to see next!"
+        description += "\n❤️ Like if you found this valuable!"
+        
+        return description[:5000]  # YouTube description limit
+    
+    def upload_video(self, video_path: str, script: Dict, topic: str) -> Tuple[bool, str]:
+        """
+        Upload video to YouTube with multi-credential failover.
+        Returns (success, video_id or error_message)
+        """
+        if not self.credentials_files:
+            return False, "No credential files found in google-console/"
+        
+        # Get optimized metadata
+        title = self._optimize_title(
+            script.get('video_title', script.get('title', f'{topic} #shorts')),
+            topic
+        )
+        
+        description = self._generate_description(script, topic)
+        tags = self._generate_seo_tags(topic, script.get('hashtags_text', ''))
+        visibility = script.get('visibility', 'public')
+        
+        print(f"\n📤 Uploading to YouTube...")
+        print(f"   📺 Title: {title}")
+        print(f"   🏷️  Tags: {len(tags)} tags ({sum(len(t) for t in tags)} chars)")
+        print(f"   🔒 Visibility: {visibility}")
+        
+        # Try each credential file until success
+        last_error = ""
+        for i, cred_file in enumerate(self.credentials_files):
+            print(f"\n   🔑 Trying credential {i+1}/{len(self.credentials_files)}: {cred_file.name[:30]}...")
+            
+            try:
+                service = self._get_authenticated_service(cred_file)
+                if not service:
+                    last_error = "Authentication failed"
+                    continue
+                
+                # Prepare upload body
+                body = {
+                    'snippet': {
+                        'title': title,
+                        'description': description,
+                        'tags': tags,
+                        'categoryId': '22'  # People & Blogs (good for Shorts)
+                    },
+                    'status': {
+                        'privacyStatus': visibility,
+                        'selfDeclaredMadeForKids': False,
+                        'madeForKids': False
+                    }
+                }
+                
+                # Create media upload
+                media = MediaFileUpload(
+                    video_path,
+                    mimetype='video/mp4',
+                    resumable=True,
+                    chunksize=1024*1024  # 1MB chunks
+                )
+                
+                # Execute upload with retry logic
+                request = service.videos().insert(
+                    part=','.join(body.keys()),
+                    body=body,
+                    media_body=media
+                )
+                
+                response = None
+                retry_count = 0
+                max_retries = 3
+                
+                while response is None:
+                    try:
+                        print(f"   ⬆️  Uploading...", end='', flush=True)
+                        status, response = request.next_chunk()
+                        if status:
+                            progress = int(status.progress() * 100)
+                            print(f"\r   ⬆️  Uploading... {progress}%", end='', flush=True)
+                    except HttpError as e:
+                        if e.resp.status in [500, 502, 503, 504] and retry_count < max_retries:
+                            retry_count += 1
+                            print(f"\n   ⚠️ Server error, retry {retry_count}/{max_retries}...")
+                            time.sleep(5 * retry_count)
+                        else:
+                            raise
+                
+                print(f"\r   ✅ Upload complete!                    ")
+                video_id = response.get('id', '')
+                video_url = f"https://youtube.com/shorts/{video_id}"
+                print(f"   🔗 URL: {video_url}")
+                
+                return True, video_id
+                
+            except HttpError as e:
+                last_error = f"HTTP Error: {e.resp.status} - {e.content.decode()[:100]}"
+                print(f"   ❌ {last_error}")
+                
+                # Check if quota exceeded - try next credential
+                if e.resp.status == 403 and 'quotaExceeded' in str(e.content):
+                    print(f"   ⚠️ Quota exceeded, trying next credential...")
+                    continue
+                    
+            except Exception as e:
+                last_error = str(e)
+                print(f"   ❌ Error: {last_error}")
+        
+        return False, f"All credentials failed. Last error: {last_error}"
+    
+    def upload_pending_videos(self) -> Dict[str, any]:
+        """
+        Upload all pending videos from scripts folder.
+        Returns summary of upload results.
+        """
+        scripts_dir = Config.SCRIPTS_DIR
+        if not scripts_dir.exists():
+            return {"error": "Scripts directory not found"}
+        
+        # Find all script files with uploaded: false
+        pending = []
+        for script_file in scripts_dir.glob("script_*.json"):
+            try:
+                with open(script_file, 'r') as f:
+                    script = json.load(f)
+                if not script.get('uploaded', False) and script.get('video_file_path'):
+                    if Path(script['video_file_path']).exists():
+                        pending.append((script_file, script))
+            except Exception as e:
+                print(f"⚠️ Error reading {script_file}: {e}")
+        
+        if not pending:
+            print("✅ No pending videos to upload!")
+            return {"uploaded": 0, "failed": 0, "pending": 0}
+        
+        print(f"\n📋 Found {len(pending)} pending video(s) to upload")
+        
+        results = {"uploaded": 0, "failed": 0, "errors": []}
+        
+        for script_file, script in pending:
+            topic = script.get('title', 'Unknown')
+            video_path = script['video_file_path']
+            
+            print(f"\n{'='*50}")
+            print(f"📹 Uploading: {topic}")
+            
+            success, result = self.upload_video(video_path, script, topic)
+            
+            if success:
+                # Update script file with upload status
+                script['uploaded'] = True
+                script['youtube_video_id'] = result
+                script['youtube_url'] = f"https://youtube.com/shorts/{result}"
+                script['upload_date'] = datetime.now().isoformat()
+                
+                with open(script_file, 'w') as f:
+                    json.dump(script, f, indent=2, ensure_ascii=False)
+                
+                results["uploaded"] += 1
+                print(f"✅ Successfully uploaded: {script['youtube_url']}")
+            else:
+                results["failed"] += 1
+                results["errors"].append({"topic": topic, "error": result})
+                print(f"❌ Failed to upload: {result}")
+            
+            # Wait between uploads to avoid rate limiting
+            if len(pending) > 1:
+                print("⏳ Waiting 5 seconds before next upload...")
+                time.sleep(5)
+        
+        print(f"\n{'='*50}")
+        print(f"📊 Upload Summary:")
+        print(f"   ✅ Uploaded: {results['uploaded']}")
+        print(f"   ❌ Failed: {results['failed']}")
+        
+        return results
+
+
+# ============================================================================
 # MAIN APPLICATION
 # ============================================================================
 
@@ -1322,6 +2192,7 @@ class ReelDesigner:
         self.image_dl = ImageDownloader()
         self.voice_gen = VoiceGenerator()
         self.composer = VideoComposer()
+        self.uploader = YouTubeUploader()
     
     def check_requirements(self) -> Dict[str, bool]:
         """Check if all requirements are met"""
@@ -1361,7 +2232,7 @@ class ReelDesigner:
         if not reqs["ollama"]:
             print("\n⚠️  Ollama is not running!")
             print("   Please start Ollama: ollama serve")
-            print("   And pull a model: ollama pull qwen3:8b")
+            print(f"   And pull a model: ollama pull {Config.OLLAMA_MODEL}")
             return
         
         # Get topic from user
@@ -1387,13 +2258,18 @@ class ReelDesigner:
     
     def create_reel(self, topic: str, duration: int = 45, 
                     voice: str = None, add_captions: bool = True,
-                    whisper_model: str = "base") -> Path:
+                    whisper_model: str = "base", auto_upload: bool = False) -> Path:
         """Create a complete reel from topic to video with word-by-word captions"""
         voice = voice or Config.TTS_VOICE
+        
+        # Generate unique timestamp for this video
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_topic = re.sub(r'[^\w\s-]', '', topic).replace(' ', '_')[:30]
         
         print("\n" + "="*60)
         print(f"🎬 Creating Reel: {topic}")
         print(f"   📝 Word-by-word captions: {'Enabled' if add_captions else 'Disabled'}")
+        print(f"   🆔 Video ID: {timestamp}_{safe_topic}")
         print("="*60)
         
         # Update whisper model if captions are enabled
@@ -1404,32 +2280,65 @@ class ReelDesigner:
         script = self.script_gen.generate_script(topic, duration)
         script = self.script_gen.enhance_image_keywords(script, topic)
         
-        # Save script
-        script_path = Config.OUTPUT_DIR / "script.json"
+        # Add metadata fields
+        script['uploaded'] = False
+        script['visibility'] = 'public'
+        script['video_file_path'] = None
+        script['created_at'] = datetime.now().isoformat()
+        script['topic'] = topic
+        script['duration_target'] = duration
+        
+        # Save script to separate timestamped file in scripts folder
+        script_filename = f"script_{timestamp}_{safe_topic}.json"
+        script_path = Config.SCRIPTS_DIR / script_filename
+        
+        # Also save to main script.json for backward compatibility
+        main_script_path = Config.OUTPUT_DIR / "script.json"
+        
         with open(script_path, 'w') as f:
-            json.dump(script, f, indent=2)
+            json.dump(script, f, indent=2, ensure_ascii=False)
+        with open(main_script_path, 'w') as f:
+            json.dump(script, f, indent=2, ensure_ascii=False)
         print(f"\n📝 Script saved to: {script_path}")
         
-        # Display script
+        # Display script with YouTube metadata
         print("\n" + "-"*40)
-        print("📜 GENERATED SCRIPT:")
+        print("📜 GENERATED SCRIPT (Loop-optimized):")
         print("-"*40)
         print(f"Title: {script.get('title', 'Untitled')}")
-        print(f"Hook: {script.get('hook', '')}")
-        print("\nSegments:")
-        for i, seg in enumerate(script.get("segments", []), 1):
-            print(f"  {i}. {seg.get('text', '')[:80]}...")
-            print(f"     Image: {seg.get('image_keyword', '')}")
-        print(f"\nCTA: {script.get('cta', '')}")
-        print(f"Hashtags: {', '.join(script.get('hashtags', []))}")
+        
+        # Show optimized YouTube title
+        video_title = script.get('video_title', script.get('title', 'Untitled'))
+        if len(video_title) > Config.MAX_TITLE_LENGTH:
+            video_title = video_title[:Config.MAX_TITLE_LENGTH-3] + "..."
+        print(f"YouTube Title ({len(video_title)} chars): {video_title}")
+        
+        if script.get('description'):
+            print(f"\nDescription:\n{script.get('description', '')[:150]}...")
+        print("\nSegments (Hook → Content → Loop Closer):")
+        segments = script.get("segments", [])
+        for i, seg in enumerate(segments, 1):
+            marker = "🎣 HOOK" if i == 1 else ("🔄 LOOP" if i == len(segments) else f"   {i}")
+            print(f"  {marker}: {seg.get('text', '')[:70]}...")
+            print(f"        📷 {seg.get('image_keyword', '')} | 😊 {seg.get('emotion', 'neutral')}")
+        
+        # Display hashtags with character count
+        hashtags_text = script.get('hashtags_text', '')
+        if hashtags_text:
+            print(f"\n#️⃣  Hashtags ({len(hashtags_text)}/{Config.MAX_TAGS_LENGTH} chars):")
+            print(f"   {hashtags_text[:200]}...")
+        else:
+            print(f"\n#️⃣  Hashtags: {', '.join(script.get('hashtags', []))}")
         
         # Step 2: Download images (with smart selection for 9:16)
         keywords = [s.get("image_keyword", topic) for s in script.get("segments", [])]
-        images_dict = self.image_dl.download_images(keywords, images_per_keyword=5)  # More images for better selection
+        images_dict = self.image_dl.download_images(keywords, images_per_keyword=5)
         selected_images = self.image_dl.select_best_images(images_dict, script.get("segments", []))
         
         # Step 3: Generate audio for each segment using Kokoro TTS
+        # Uses sentence-by-sentence generation for natural pauses
         print(f"\n🎤 Generating voice narration with Kokoro TTS (voice: {voice})...")
+        print("   Using sentence-by-sentence processing for natural speech flow...")
         audio_files = []
         
         for i, segment in enumerate(script.get("segments", [])):
@@ -1437,8 +2346,15 @@ class ReelDesigner:
             emotion = segment.get("emotion", "neutral")
             audio_path = Config.AUDIO_DIR / f"segment_{i:02d}.wav"
             
+            # Expand abbreviations for proper TTS pronunciation
+            tts_text = expand_abbreviations_for_tts(text)
+            
             print(f"  Segment {i+1}: {text[:50]}...")
-            result = self.voice_gen.generate_audio(text, audio_path, voice, emotion)
+            if tts_text != text:
+                print(f"    📝 TTS: {tts_text[:50]}...")
+            
+            # Use sentence-by-sentence TTS for natural pauses
+            result = self.voice_gen.generate_audio_sentence_by_sentence(tts_text, audio_path, voice, emotion)
             
             if result:
                 audio_files.append(result)
@@ -1448,7 +2364,7 @@ class ReelDesigner:
                 audio_files.append(None)
         
         # Step 4: Compose video with captions, music and click sounds
-        output_video = Config.VIDEO_DIR / f"reel_{topic.replace(' ', '_')[:30]}.mp4"
+        output_video = Config.VIDEO_DIR / f"reel_{timestamp}_{safe_topic}.mp4"
         
         # Filter out None values
         valid_data = [
@@ -1464,18 +2380,81 @@ class ReelDesigner:
                 add_captions=add_captions
             )
             
+            # Update script with video file path
+            script['video_file_path'] = str(final_video.absolute())
+            script['video_filename'] = final_video.name
+            
+            # Save updated script to both locations
+            with open(script_path, 'w') as f:
+                json.dump(script, f, indent=2, ensure_ascii=False)
+            with open(main_script_path, 'w') as f:
+                json.dump(script, f, indent=2, ensure_ascii=False)
+            
             print("\n" + "="*60)
             print("✅ REEL CREATED SUCCESSFULLY!")
             print("="*60)
-            print(f"📁 Output: {final_video}")
+            print(f"📁 Video: {final_video}")
             print(f"📝 Script: {script_path}")
+            print(f"📺 YouTube Title: {script.get('video_title', '')[:Config.MAX_TITLE_LENGTH]}")
+            print(f"📊 Status: {'Uploaded' if script.get('uploaded') else 'Pending Upload'}")
+            print(f"🔒 Visibility: {script.get('visibility', 'public')}")
             if add_captions:
-                print(f"📝 Features: Word-by-word captions, Ken Burns effects, Background music")
+                print(f"✨ Features: Word-by-word captions, Ken Burns effects, Background music")
+            
+            # Auto-upload if requested
+            if auto_upload:
+                print("\n" + "-"*40)
+                print("🚀 Auto-uploading to YouTube...")
+                success, result = self.uploader.upload_video(
+                    str(final_video), script, topic
+                )
+                if success:
+                    script['uploaded'] = True
+                    script['youtube_video_id'] = result
+                    script['youtube_url'] = f"https://youtube.com/shorts/{result}"
+                    script['upload_date'] = datetime.now().isoformat()
+                    
+                    with open(script_path, 'w') as f:
+                        json.dump(script, f, indent=2, ensure_ascii=False)
+                    with open(main_script_path, 'w') as f:
+                        json.dump(script, f, indent=2, ensure_ascii=False)
+                    
+                    print(f"✅ Uploaded: {script['youtube_url']}")
+                else:
+                    print(f"❌ Upload failed: {result}")
             
             return final_video
         else:
             print("\n❌ Failed to create reel: No valid segments")
             return None
+    
+    def upload_pending(self) -> Dict:
+        """Upload all pending videos"""
+        return self.uploader.upload_pending_videos()
+    
+    def list_pending(self) -> List[Dict]:
+        """List all pending (not uploaded) videos"""
+        scripts_dir = Config.SCRIPTS_DIR
+        if not scripts_dir.exists():
+            return []
+        
+        pending = []
+        for script_file in sorted(scripts_dir.glob("script_*.json")):
+            try:
+                with open(script_file, 'r') as f:
+                    script = json.load(f)
+                if not script.get('uploaded', False):
+                    pending.append({
+                        'file': script_file.name,
+                        'title': script.get('title', 'Unknown'),
+                        'video_title': script.get('video_title', ''),
+                        'video_exists': Path(script.get('video_file_path', '')).exists() if script.get('video_file_path') else False,
+                        'created': script.get('created_at', 'Unknown')
+                    })
+            except Exception as e:
+                print(f"⚠️ Error reading {script_file}: {e}")
+        
+        return pending
 
 
 # ============================================================================
@@ -1486,7 +2465,18 @@ def main():
     """Main entry point"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Interactive Reel Shorts Designer with Kokoro TTS and Word-by-Word Captions")
+    parser = argparse.ArgumentParser(
+        description="Interactive Reel Shorts Designer with YouTube Upload",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py                           # Interactive mode
+  python main.py -t "Bitcoin investing"    # Create reel for topic
+  python main.py -t "Elon Musk" --upload   # Create and auto-upload
+  python main.py --upload-pending          # Upload all pending videos
+  python main.py --list-pending            # List pending uploads
+        """
+    )
     parser.add_argument("--topic", "-t", type=str, help="Topic for the reel")
     parser.add_argument("--duration", "-d", type=int, default=45, help="Target duration in seconds")
     parser.add_argument("--voice", "-v", type=str, default=Config.TTS_VOICE, help="Kokoro TTS voice name (e.g., af_bella, af_nicole)")
@@ -1497,6 +2487,11 @@ def main():
                        choices=["tiny", "base", "small", "medium", "large"],
                        help="Whisper model size for transcription (default: base)")
     
+    # YouTube upload options
+    parser.add_argument("--upload", "-u", action="store_true", help="Auto-upload to YouTube after creation")
+    parser.add_argument("--upload-pending", action="store_true", help="Upload all pending videos")
+    parser.add_argument("--list-pending", action="store_true", help="List all pending (not uploaded) videos")
+    
     args = parser.parse_args()
     
     # Update config if specified
@@ -1505,11 +2500,43 @@ def main():
     
     designer = ReelDesigner()
     
+    # Handle upload-only commands
+    if args.upload_pending:
+        print("\n" + "="*60)
+        print("📤 UPLOADING PENDING VIDEOS")
+        print("="*60)
+        designer.upload_pending()
+        return
+    
+    if args.list_pending:
+        print("\n" + "="*60)
+        print("📋 PENDING VIDEOS")
+        print("="*60)
+        pending = designer.list_pending()
+        if not pending:
+            print("✅ No pending videos found!")
+        else:
+            print(f"Found {len(pending)} pending video(s):\n")
+            for i, video in enumerate(pending, 1):
+                status = "✅ Ready" if video['video_exists'] else "❌ Missing"
+                print(f"  {i}. {video['title']}")
+                print(f"     📝 {video['file']}")
+                print(f"     📺 {video['video_title'][:50]}...")
+                print(f"     📁 {status}")
+                print(f"     📅 {video['created']}")
+                print()
+        return
+    
     if args.topic:
         # Non-interactive mode
-        designer.create_reel(args.topic, args.duration, args.voice, 
-                            add_captions=not args.no_captions,
-                            whisper_model=args.whisper_model)
+        designer.create_reel(
+            args.topic, 
+            args.duration, 
+            args.voice, 
+            add_captions=not args.no_captions,
+            whisper_model=args.whisper_model,
+            auto_upload=args.upload
+        )
     else:
         # Interactive mode
         designer.interactive_mode()

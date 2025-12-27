@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/   
+ENV/  
+google-console
+.DS_Store
+.idea/
+.vscode/
+*.log

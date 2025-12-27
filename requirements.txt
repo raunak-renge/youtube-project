@@ -11,3 +11,9 @@ openai-whisper
 # Practical/likely-needed extras (used indirectly or by typical setups)
 ffmpeg-python
 tqdm
+
+# YouTube Upload API dependencies
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
