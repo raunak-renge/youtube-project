@@ -38,7 +38,6 @@ def install_packages():
         "google-api-python-client",
         "google-generativeai",
         "mediapipe",
-        "g4f",
     ]
     for pkg in packages:
         try:
@@ -57,8 +56,6 @@ def install_packages():
                 pkg_import = "google.genai"
             elif pkg == "mediapipe":
                 pkg_import = "mediapipe"
-            elif pkg == "g4f":
-                pkg_import = "g4f"
             __import__(pkg_import)
         except ImportError:
             print(f"Installing {pkg}...")
@@ -95,14 +92,6 @@ from googleapiclient.errors import HttpError
 
 # Gemini AI for script generation
 from google import genai
-
-# g4f for thumbnail generation
-try:
-    from g4f.client import Client as G4FClient
-    G4F_AVAILABLE = True
-except ImportError:
-    G4F_AVAILABLE = False
-    print("⚠️  g4f not installed. Thumbnail generation will use fallback.")
 
 
 # ============================================================================
@@ -341,7 +330,6 @@ class Config:
     AUDIO_DIR = OUTPUT_DIR / "audio"
     VIDEO_DIR = OUTPUT_DIR / "video"
     SCRIPTS_DIR = OUTPUT_DIR / "scripts"  # Separate scripts folder
-    THUMBNAIL_DIR = OUTPUT_DIR / "thumbnails"  # Thumbnails folder
     
     # Audio
     MUSIC_DIR = BASE_DIR / "background-sounds" / "music"
@@ -380,7 +368,7 @@ class Config:
     @classmethod
     def setup_dirs(cls):
         """Create output directories"""
-        for d in [cls.OUTPUT_DIR, cls.IMAGES_DIR, cls.AUDIO_DIR, cls.VIDEO_DIR, cls.SCRIPTS_DIR, cls.THUMBNAIL_DIR]:
+        for d in [cls.OUTPUT_DIR, cls.IMAGES_DIR, cls.AUDIO_DIR, cls.VIDEO_DIR, cls.SCRIPTS_DIR]:
             d.mkdir(parents=True, exist_ok=True)
     
     @classmethod
@@ -2779,23 +2767,13 @@ class YouTubeUploader:
         
         return description[:5000]  # YouTube description limit
     
-    def upload_video(self, video_path: str, script: Dict, topic: str, thumbnail_path: str = None) -> Tuple[bool, str]:
+    def upload_video(self, video_path: str, script: Dict, topic: str) -> Tuple[bool, str]:
         """
         Upload video to YouTube with multi-credential failover.
         Returns (success, video_id or error_message)
-        
-        Args:
-            video_path: Path to the video file
-            script: Script dictionary with metadata
-            topic: Video topic
-            thumbnail_path: Optional path to custom thumbnail image
         """
         if not self.credentials_files:
             return False, "No credential files found in google-console/"
-        
-        # Get thumbnail path from script if not provided
-        if thumbnail_path is None:
-            thumbnail_path = script.get('thumbnail_path')
         
         # Get optimized metadata
         title = self._optimize_title(
@@ -2811,8 +2789,6 @@ class YouTubeUploader:
         print(f"   📺 Title: {title}")
         print(f"   🏷️  Tags: {len(tags)} tags ({sum(len(t) for t in tags)} chars)")
         print(f"   🔒 Visibility: {visibility}")
-        if thumbnail_path and Path(thumbnail_path).exists():
-            print(f"   🖼️  Thumbnail: {Path(thumbnail_path).name}")
         
         # Try each credential file until success
         last_error = ""
@@ -2878,26 +2854,6 @@ class YouTubeUploader:
                 video_id = response.get('id', '')
                 video_url = f"https://youtube.com/shorts/{video_id}"
                 print(f"   🔗 URL: {video_url}")
-                
-                # Upload thumbnail if available
-                if thumbnail_path and Path(thumbnail_path).exists() and video_id:
-                    try:
-                        print(f"   🖼️  Uploading thumbnail...")
-                        thumbnail_media = MediaFileUpload(
-                            thumbnail_path,
-                            mimetype='image/jpeg',
-                            resumable=False
-                        )
-                        service.thumbnails().set(
-                            videoId=video_id,
-                            media_body=thumbnail_media
-                        ).execute()
-                        print(f"   ✅ Thumbnail uploaded successfully!")
-                    except HttpError as e:
-                        # Thumbnail upload requires channel verification, may fail
-                        print(f"   ⚠️ Thumbnail upload failed (may require channel verification): {e.resp.status}")
-                    except Exception as e:
-                        print(f"   ⚠️ Thumbnail upload error: {e}")
                 
                 return True, video_id
                 
@@ -2985,279 +2941,6 @@ class YouTubeUploader:
 
 
 # ============================================================================
-# THUMBNAIL GENERATOR (g4f AI Image Generation with Gemini prompts)
-# ============================================================================
-
-THUMBNAIL_PROMPT_TEMPLATE = '''You are an expert YouTube thumbnail designer. Create a DETAILED image generation prompt for an eye-catching thumbnail.
-
-Topic: "{topic}"
-Video Title: "{title}"
-
-🎯 GOAL: Create a thumbnail that gets MAXIMUM clicks. Thumbnails should be:
-- Visually BOLD and attention-grabbing
-- High contrast colors (red, yellow, blue work best)
-- Show EMOTION or action
-- Include relevant imagery for the topic
-- Professional and clean composition
-
-📐 TECHNICAL REQUIREMENTS:
-- Aspect ratio: 16:9 (horizontal/landscape format)
-- Style: Photorealistic or high-quality digital art
-- NO text in the image (text will be added separately)
-- High resolution, vibrant colors
-- Clean background that doesn't distract
-
-📋 OUTPUT FORMAT (JSON only):
-{{
-  "prompt": "Detailed image generation prompt (80-150 words describing the thumbnail image)",
-  "style": "photorealistic/digital-art/3d-render/illustration",
-  "dominant_colors": ["color1", "color2", "color3"],
-  "mood": "exciting/dramatic/curious/shocking/inspiring"
-}}
-
-EXAMPLE for topic "Bitcoin Price Prediction":
-{{
-  "prompt": "A dramatic photorealistic image of a golden Bitcoin coin soaring upward through clouds with lightning bolts around it, glowing orange and yellow light beams, dark blue sky background, cinematic lighting, ultra high definition, crypto trading concept, wealth and success imagery, professional photography style",
-  "style": "photorealistic",
-  "dominant_colors": ["gold", "orange", "dark blue"],
-  "mood": "exciting"
-}}
-
-NOW CREATE a compelling thumbnail prompt for: "{topic}"'''
-
-
-class ThumbnailGenerator:
-    """
-    Generate eye-catching thumbnails using g4f AI image generation.
-    Uses Gemini to create optimized prompts, then g4f to generate images.
-    Falls back to video frame extraction if g4f fails.
-    """
-    
-    def __init__(self, gemini: 'GeminiClient', output_dir: Path = None):
-        self.gemini = gemini
-        self.output_dir = output_dir or Config.THUMBNAIL_DIR
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self._g4f_client = None
-    
-    def _get_g4f_client(self):
-        """Get or create g4f client instance"""
-        if self._g4f_client is None and G4F_AVAILABLE:
-            self._g4f_client = G4FClient()
-        return self._g4f_client
-    
-    def _generate_thumbnail_prompt(self, topic: str, title: str) -> Dict:
-        """Use Gemini to generate an optimized thumbnail prompt"""
-        prompt = THUMBNAIL_PROMPT_TEMPLATE.format(topic=topic, title=title)
-        
-        response = self.gemini.generate(prompt, temperature=0.8)
-        
-        if not response:
-            return self._get_fallback_prompt(topic, title)
-        
-        try:
-            # Extract JSON from response
-            json_match = re.search(r'\{[\s\S]*\}', response)
-            if json_match:
-                json_str = json_match.group()
-                json_str = re.sub(r',\s*}', '}', json_str)
-                json_str = re.sub(r',\s*]', ']', json_str)
-                return json.loads(json_str)
-        except (json.JSONDecodeError, Exception) as e:
-            print(f"   ⚠️ Error parsing thumbnail prompt: {e}")
-        
-        return self._get_fallback_prompt(topic, title)
-    
-    def _get_fallback_prompt(self, topic: str, title: str) -> Dict:
-        """Generate a fallback prompt without Gemini"""
-        clean_topic = topic.lower()
-        
-        # Determine style based on topic keywords
-        if any(word in clean_topic for word in ['tech', 'ai', 'crypto', 'bitcoin', 'software', 'app']):
-            style = "digital-art"
-            mood = "futuristic"
-            prompt = f"Futuristic digital art visualization of {topic}, glowing neon blue and purple colors, high-tech interface elements, dark background with light particles, cinematic lighting, 4K ultra HD quality"
-        elif any(word in clean_topic for word in ['money', 'wealth', 'rich', 'millionaire', 'investing', 'stock']):
-            style = "photorealistic"
-            mood = "exciting"
-            prompt = f"Dramatic photorealistic image representing {topic}, golden coins and dollar bills, success and wealth imagery, bright golden light beams, professional studio lighting, high contrast"
-        elif any(word in clean_topic for word in ['sport', 'football', 'soccer', 'basketball', 'athlete', 'ronaldo', 'messi']):
-            style = "photorealistic"
-            mood = "dramatic"
-            prompt = f"Epic sports photography style image for {topic}, dramatic stadium lighting, action pose, intense emotion, vibrant colors, professional sports photography"
-        else:
-            style = "photorealistic"
-            mood = "curious"
-            prompt = f"Eye-catching professional thumbnail image for {topic}, bold vibrant colors, dramatic lighting, clean composition, high definition photography style, attention-grabbing visual"
-        
-        return {
-            "prompt": prompt,
-            "style": style,
-            "dominant_colors": ["blue", "yellow", "red"],
-            "mood": mood
-        }
-    
-    def _generate_with_g4f(self, prompt: str, output_path: Path) -> Optional[Path]:
-        """Generate thumbnail using g4f image generation"""
-        if not G4F_AVAILABLE:
-            print("   ⚠️ g4f not available, using fallback")
-            return None
-        
-        client = self._get_g4f_client()
-        if not client:
-            return None
-        
-        try:
-            print(f"   🎨 Generating thumbnail with g4f...")
-            response = client.images.generate(
-                model="sd-3.5-large",
-                prompt=prompt,
-                response_format="url"
-            )
-            
-            image_url = response.data[0].url
-            print(f"   🔗 Generated image URL: {image_url[:60]}...")
-            
-            # Download the image
-            img_response = requests.get(image_url, timeout=30)
-            img_response.raise_for_status()
-            
-            # Save original image
-            temp_path = output_path.with_suffix('.temp.png')
-            with open(temp_path, 'wb') as f:
-                f.write(img_response.content)
-            
-            # Resize to standard thumbnail size (1280x720) for consistency
-            self._resize_thumbnail(temp_path, output_path)
-            
-            # Clean up temp file
-            if temp_path.exists():
-                temp_path.unlink()
-            
-            print(f"   ✅ Thumbnail saved: {output_path}")
-            return output_path
-            
-        except Exception as e:
-            print(f"   ❌ g4f generation failed: {e}")
-            return None
-    
-    def _resize_thumbnail(self, input_path: Path, output_path: Path, 
-                          target_width: int = 1280, target_height: int = 720):
-        """Resize image to standard YouTube thumbnail size (16:9)"""
-        try:
-            with Image.open(input_path) as img:
-                # Convert to RGB if necessary
-                if img.mode in ('RGBA', 'P'):
-                    img = img.convert('RGB')
-                
-                # Calculate aspect ratios
-                img_aspect = img.width / img.height
-                target_aspect = target_width / target_height
-                
-                if img_aspect > target_aspect:
-                    # Image is wider - crop sides
-                    new_width = int(img.height * target_aspect)
-                    left = (img.width - new_width) // 2
-                    img = img.crop((left, 0, left + new_width, img.height))
-                else:
-                    # Image is taller - crop top/bottom
-                    new_height = int(img.width / target_aspect)
-                    top = (img.height - new_height) // 2
-                    img = img.crop((0, top, img.width, top + new_height))
-                
-                # Resize to target dimensions
-                img = img.resize((target_width, target_height), Image.LANCZOS)
-                img.save(output_path, 'JPEG', quality=95)
-                
-        except Exception as e:
-            print(f"   ⚠️ Resize failed: {e}, copying original")
-            shutil.copy(input_path, output_path)
-    
-    def _extract_video_frame(self, video_path: Path, output_path: Path, 
-                             frame_time: float = 2.0) -> Optional[Path]:
-        """Extract a frame from video as fallback thumbnail"""
-        try:
-            print(f"   📹 Extracting frame from video at {frame_time}s...")
-            
-            clip = VideoFileClip(str(video_path))
-            
-            # Get frame at specified time (or middle if time exceeds duration)
-            if frame_time >= clip.duration:
-                frame_time = clip.duration / 2
-            
-            frame = clip.get_frame(frame_time)
-            clip.close()
-            
-            # Convert to PIL Image
-            img = Image.fromarray(frame)
-            
-            # For 9:16 video, we need to letterbox or crop to 16:9
-            # We'll take a horizontal slice from the middle
-            if img.height > img.width:
-                # Portrait video - take center section and resize
-                target_height = int(img.width * 9 / 16)
-                top = (img.height - target_height) // 2
-                img = img.crop((0, top, img.width, top + target_height))
-            
-            # Resize to 1280x720
-            img = img.resize((1280, 720), Image.LANCZOS)
-            
-            # Save
-            img.save(output_path, 'JPEG', quality=95)
-            print(f"   ✅ Fallback thumbnail extracted: {output_path}")
-            return output_path
-            
-        except Exception as e:
-            print(f"   ❌ Frame extraction failed: {e}")
-            return None
-    
-    def generate_thumbnail(self, topic: str, title: str, video_path: Path = None,
-                          output_name: str = None) -> Optional[Path]:
-        """
-        Generate an attractive thumbnail for the video.
-        
-        Args:
-            topic: The video topic
-            title: The video title
-            video_path: Path to the video file (for fallback frame extraction)
-            output_name: Output filename (without extension)
-        
-        Returns:
-            Path to the generated thumbnail, or None if failed
-        """
-        if output_name is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_topic = re.sub(r'[^\w\s-]', '', topic).replace(' ', '_')[:20]
-            output_name = f"thumbnail_{timestamp}_{safe_topic}"
-        
-        output_path = self.output_dir / f"{output_name}.jpg"
-        
-        print(f"\n🖼️  Generating thumbnail...")
-        print(f"   📝 Topic: {topic}")
-        
-        # Step 1: Generate optimized prompt using Gemini
-        print(f"   🤖 Generating prompt with Gemini...")
-        prompt_data = self._generate_thumbnail_prompt(topic, title)
-        
-        print(f"   🎨 Style: {prompt_data.get('style', 'photorealistic')}")
-        print(f"   🎭 Mood: {prompt_data.get('mood', 'exciting')}")
-        
-        # Step 2: Try g4f image generation
-        thumbnail_prompt = prompt_data.get('prompt', '')
-        if thumbnail_prompt:
-            result = self._generate_with_g4f(thumbnail_prompt, output_path)
-            if result:
-                return result
-        
-        # Step 3: Fallback to video frame extraction
-        print(f"   ⚠️ Falling back to video frame extraction...")
-        if video_path and video_path.exists():
-            return self._extract_video_frame(video_path, output_path)
-        
-        print(f"   ❌ Could not generate thumbnail")
-        return None
-
-
-# ============================================================================
 # MAIN APPLICATION
 # ============================================================================
 
@@ -3272,7 +2955,6 @@ class ReelDesigner:
         self.voice_gen = VoiceGenerator()
         self.composer = VideoComposer()
         self.uploader = YouTubeUploader()
-        self.thumbnail_gen = ThumbnailGenerator(self.gemini)  # Thumbnail generator
     
     def check_requirements(self) -> Dict[str, bool]:
         """Check if all requirements are met"""
@@ -3504,19 +3186,6 @@ class ReelDesigner:
             # Update script with video file path
             script['video_file_path'] = str(final_video.absolute())
             script['video_filename'] = final_video.name
-            
-            # Step 5: Generate thumbnail using g4f (with Gemini prompts)
-            thumbnail_path = self.thumbnail_gen.generate_thumbnail(
-                topic=topic,
-                title=script.get('video_title', script.get('title', topic)),
-                video_path=final_video,
-                output_name=video_base_name
-            )
-            
-            if thumbnail_path:
-                script['thumbnail_path'] = str(thumbnail_path.absolute())
-                script['thumbnail_filename'] = thumbnail_path.name
-                print(f"🖼️  Thumbnail: {thumbnail_path}")
             
             # Save updated script to both locations
             with open(script_path, 'w') as f:
