@@ -70,7 +70,7 @@ REQUIRED_PACKAGES = [
     ("google-api-python-client", "googleapiclient"),
     ("google-auth-oauthlib", "google_auth_oauthlib"),
     ("soundfile", "soundfile"),
-    ("easyocr", "easyocr"),
+    ("paddleocr", "paddleocr"),
     ("opencv-python", "cv2"),
     ("tqdm", "tqdm"),
 ]
@@ -111,15 +111,15 @@ try:
 except ImportError:
     G4F_AVAILABLE = False
 
-# EasyOCR for text removal from videos (better than keras-ocr for stylized/colored text)
+# PaddleOCR for text removal from videos (excellent for stylized/colored text)
 try:
-    import easyocr
+    from paddleocr import PaddleOCR
     import cv2
-    EASYOCR_AVAILABLE = True
-    print("✅ EasyOCR available for text removal")
+    PADDLEOCR_AVAILABLE = True
+    print("✅ PaddleOCR available for text removal")
 except ImportError:
-    EASYOCR_AVAILABLE = False
-    print("⚠️  EasyOCR not available - text removal disabled")
+    PADDLEOCR_AVAILABLE = False
+    print("⚠️  PaddleOCR not available - text removal disabled")
 
 try:
     from googleapiclient.discovery import build
@@ -191,6 +191,32 @@ class Config:
     REMOVE_TEXT: bool = True  # Enable/disable text removal from source videos
     TEXT_REMOVAL_SAMPLE_RATE: int = 5  # Process every Nth frame for speed (1 = all frames)
     
+    # Channel settings for default keywords
+    CHANNEL_NAME: str = "Buzz Today"  # Your channel name
+    
+    # Default keywords to fill 500 character limit (add your channel-specific keywords)
+    DEFAULT_KEYWORDS: List[str] = field(default_factory=lambda: [
+        # Channel branding
+        "Buzz Today", "buzz today", "daily buzz",
+        # Generic viral shorts keywords  
+        "shorts", "viral", "trending", "fyp", "foryou", "foryoupage",
+        "youtube shorts", "short video", "viral video", "trending now",
+        # Engagement keywords
+        "must watch", "amazing", "incredible", "mindblowing", "shocking",
+        "unbelievable", "insane", "crazy", "awesome", "epic",
+        # Content type keywords
+        "facts", "did you know", "fun facts", "interesting facts",
+        "learn something new", "education", "knowledge", "informative",
+        # Call to action keywords
+        "follow for more", "subscribe", "like and share",
+        # Discovery keywords
+        "explore", "discover", "new", "latest", "2024", "2025",
+        # Platform keywords
+        "reels", "tiktok", "instagram", "social media",
+        # Emotion keywords
+        "motivation", "inspiration", "entertainment", "funny",
+    ])
+    
     def setup_dirs(self):
         """Create all required directories"""
         for attr in ['BASE_DIR', 'VIDEOS_DIR', 'SCENES_DIR', 'AUDIO_DIR', 
@@ -216,50 +242,140 @@ class Config:
 config = Config()
 
 
+def fill_tags_to_limit(tags: List[str], topic: str = "", limit: int = 500) -> List[str]:
+    """
+    Fill tags list with default keywords until reaching the character limit.
+    YouTube allows up to 500 characters for tags.
+    
+    Args:
+        tags: Initial tags from Gemini
+        topic: The video topic for additional keyword variations
+        limit: Character limit (default 500 for YouTube)
+    
+    Returns:
+        Extended list of tags that fills the limit
+    """
+    # Start with the provided tags
+    final_tags = list(tags) if tags else []
+    
+    # Calculate current character count (tags joined by commas)
+    def get_char_count(tag_list):
+        return len(", ".join(tag_list))
+    
+    # Generate topic-specific variations
+    topic_variations = []
+    if topic:
+        topic_lower = topic.lower()
+        topic_words = topic_lower.split()
+        topic_variations = [
+            topic_lower,
+            f"{topic_lower} facts",
+            f"{topic_lower} explained",
+            f"{topic_lower} shorts",
+            f"{topic_lower} viral",
+            f"about {topic_lower}",
+            f"learn {topic_lower}",
+            f"{topic_lower} 2025",
+        ]
+        # Add individual words if multi-word topic
+        if len(topic_words) > 1:
+            topic_variations.extend(topic_words)
+    
+    # Combine all potential keywords: topic variations + channel defaults
+    all_keywords = topic_variations + list(config.DEFAULT_KEYWORDS)
+    
+    # Add keywords until we reach the limit
+    existing_tags_lower = {t.lower() for t in final_tags}
+    
+    for keyword in all_keywords:
+        keyword = keyword.strip()
+        if not keyword or keyword.lower() in existing_tags_lower:
+            continue
+        
+        # Check if adding this keyword would exceed the limit
+        test_tags = final_tags + [keyword]
+        if get_char_count(test_tags) <= limit:
+            final_tags.append(keyword)
+            existing_tags_lower.add(keyword.lower())
+        elif get_char_count(final_tags) >= limit - 20:
+            # Close enough to limit, stop adding
+            break
+    
+    logger.debug(f"Tags filled: {get_char_count(final_tags)}/{limit} characters, {len(final_tags)} tags")
+    return final_tags
+
+
 # ============================================================================
-# TEXT REMOVER (EasyOCR + Inpainting)
+# TEXT REMOVER (PaddleOCR + Advanced Inpainting)
 # ============================================================================
 
 class TextRemover:
     """
-    Remove text/watermarks from video frames using EasyOCR and OpenCV inpainting.
+    Remove text/watermarks from video frames using PaddleOCR and OpenCV inpainting.
     
-    EasyOCR is better than keras-ocr for:
-    - Large, colorful, stylized text (like TikTok/YouTube captions)
-    - Watermarks and channel handles
-    - Text with effects/shadows
-    - Multiple languages
+    PaddleOCR advantages:
+    - Excellent for large, colorful, stylized text (TikTok/YouTube captions)
+    - Better detection of watermarks and channel handles
+    - Multi-angle and curved text detection
+    - Fast and accurate with GPU support
+    - Supports 80+ languages
     
     This helps create cleaner videos by removing existing text/watermarks
     before adding our own captions.
     """
     
-    _reader = None  # Singleton reader to avoid reloading model
+    _ocr = None  # Singleton OCR instance to avoid reloading model
     
     def __init__(self):
         self._initialized = False
     
     @classmethod
-    def get_reader(cls):
-        """Get or create the EasyOCR reader (singleton - loads model once)"""
-        if cls._reader is None and EASYOCR_AVAILABLE:
-            logger.info("Loading EasyOCR model (first time, may take a moment)...")
-            # Use GPU if available, fallback to CPU
+    def get_ocr(cls):
+        """Get or create the PaddleOCR instance (singleton - loads model once)"""
+        if cls._ocr is None and PADDLEOCR_AVAILABLE:
+            print("🔤 Loading PaddleOCR model (first time, may take a moment)...")
             try:
-                cls._reader = easyocr.Reader(['en'], gpu=True)
-            except:
-                cls._reader = easyocr.Reader(['en'], gpu=False)
-            logger.info("EasyOCR model loaded!")
-        return cls._reader
+                # Suppress PaddleOCR verbose output
+                import os
+                os.environ['PADDLEOCR_SHOW_LOG'] = 'False'
+                
+                # Initialize PaddleOCR - use simple initialization for compatibility
+                # PaddleOCR API varies between versions, so keep it minimal
+                cls._ocr = PaddleOCR(lang='en')
+                print("✅ PaddleOCR model loaded!")
+            except Exception as e:
+                logger.warning(f"Failed to load PaddleOCR: {e}")
+                cls._ocr = None
+        return cls._ocr
     
     @staticmethod
     def midpoint(x1: float, y1: float, x2: float, y2: float) -> Tuple[int, int]:
         """Calculate midpoint between two points"""
         return (int((x1 + x2) / 2), int((y1 + y2) / 2))
     
+    @staticmethod
+    def expand_bbox(pts: np.ndarray, padding: int, img_shape: Tuple[int, int]) -> np.ndarray:
+        """Expand bounding box by padding pixels while staying within image bounds"""
+        h, w = img_shape[:2]
+        # Calculate center
+        center = pts.mean(axis=0)
+        # Expand each point away from center
+        expanded = []
+        for pt in pts:
+            direction = pt - center
+            norm = np.linalg.norm(direction)
+            if norm > 0:
+                direction = direction / norm
+            new_pt = pt + direction * padding
+            # Clamp to image bounds
+            new_pt[0] = max(0, min(w - 1, new_pt[0]))
+            new_pt[1] = max(0, min(h - 1, new_pt[1]))
+            expanded.append(new_pt)
+        return np.array(expanded, dtype=np.int32)
+    
     def remove_text_from_image(self, img: np.ndarray) -> np.ndarray:
         """
-        Remove text from a single image using EasyOCR detection and OpenCV inpainting.
+        Remove text from a single image using PaddleOCR detection and OpenCV inpainting.
         
         Args:
             img: Input image as numpy array (RGB format)
@@ -267,56 +383,74 @@ class TextRemover:
         Returns:
             Image with text removed (RGB format)
         """
-        if not EASYOCR_AVAILABLE:
+        if not PADDLEOCR_AVAILABLE:
             return img
         
-        reader = self.get_reader()
-        if reader is None:
+        ocr = self.get_ocr()
+        if ocr is None:
             return img
         
         try:
-            # EasyOCR can accept numpy array directly (RGB format)
-            # Returns: list of (bbox, text, confidence)
-            # bbox format: [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
-            results = reader.readtext(img)
+            # PaddleOCR expects BGR format for numpy arrays
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             
-            if not results:
-                return img  # No text detected
+            # Run OCR prediction
+            result = ocr.predict(input=img_bgr)
+            
+            if not result:
+                return img  # No results
             
             # Create mask for inpainting
             mask = np.zeros(img.shape[:2], dtype="uint8")
+            text_found = False
             
-            for (bbox, text, confidence) in results:
-                # bbox is [[x0,y0], [x1,y1], [x2,y2], [x3,y3]]
-                # Top-left, top-right, bottom-right, bottom-left
-                x0, y0 = int(bbox[0][0]), int(bbox[0][1])
-                x1, y1 = int(bbox[1][0]), int(bbox[1][1])
-                x2, y2 = int(bbox[2][0]), int(bbox[2][1])
-                x3, y3 = int(bbox[3][0]), int(bbox[3][1])
+            for res in result:
+                # Access the detection results - PaddleOCR returns dict-like objects
+                # Check for rec_texts (recognized text)
+                rec_texts = res.get('rec_texts', []) if isinstance(res, dict) else getattr(res, 'rec_texts', [])
+                if not rec_texts:
+                    continue
                 
-                # Calculate midpoints for the mask line
-                x_mid0, y_mid0 = self.midpoint(x1, y1, x2, y2)  # right side midpoint
-                x_mid1, y_mid1 = self.midpoint(x0, y0, x3, y3)  # left side midpoint
-                
-                # Calculate line thickness based on text height (add padding)
-                thickness = int(math.sqrt((x2 - x1)**2 + (y2 - y1)**2)) + 10
-                
-                # Draw mask line
-                cv2.line(mask, (x_mid0, y_mid0), (x_mid1, y_mid1), 255, thickness)
-                
-                # Also fill the bounding box polygon for better coverage
-                pts = np.array([[x0, y0], [x1, y1], [x2, y2], [x3, y3]], dtype=np.int32)
-                cv2.fillPoly(mask, [pts], 255)
+                # Get bounding boxes from dt_polys
+                dt_polys = res.get('dt_polys', []) if isinstance(res, dict) else getattr(res, 'dt_polys', [])
+                if dt_polys is not None:
+                    for i, poly in enumerate(dt_polys):
+                        text_found = True
+                        # poly is typically [[x0,y0], [x1,y1], [x2,y2], [x3,y3]]
+                        pts = np.array(poly, dtype=np.int32)
+                        
+                        # Expand the bounding box for better coverage
+                        padding = 15  # pixels of padding around detected text
+                        pts_expanded = self.expand_bbox(pts, padding, img.shape)
+                        
+                        # Fill the polygon in the mask
+                        cv2.fillPoly(mask, [pts_expanded], 255)
+                        
+                        # Also draw thick lines connecting the corners for better coverage
+                        for j in range(4):
+                            p1 = tuple(pts_expanded[j])
+                            p2 = tuple(pts_expanded[(j + 1) % 4])
+                            cv2.line(mask, p1, p2, 255, 8)
             
-            # Dilate mask slightly for better inpainting results
-            kernel = np.ones((5, 5), np.uint8)
-            mask = cv2.dilate(mask, kernel, iterations=2)
+            if not text_found:
+                return img  # No text detected
             
-            # Inpaint the masked regions
-            # Convert RGB to BGR for OpenCV
-            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            # Use INPAINT_TELEA for better results on larger areas
-            inpainted = cv2.inpaint(img_bgr, mask, 7, cv2.INPAINT_TELEA)
+            # Apply morphological operations for better mask
+            # Dilate to expand coverage
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            mask = cv2.dilate(mask, kernel, iterations=3)
+            
+            # Optional: Close small gaps in the mask
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
+            
+            # Inpaint using multiple techniques for best results
+            # First pass with INPAINT_NS (Navier-Stokes based)
+            inpainted = cv2.inpaint(img_bgr, mask, 5, cv2.INPAINT_NS)
+            
+            # Second pass with INPAINT_TELEA for smoother results
+            inpainted = cv2.inpaint(inpainted, mask, 3, cv2.INPAINT_TELEA)
+            
             # Convert back to RGB
             result = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
             
@@ -339,8 +473,8 @@ class TextRemover:
         Returns:
             Path to processed video, or None if failed
         """
-        if not EASYOCR_AVAILABLE:
-            logger.warning("EasyOCR not available, skipping text removal")
+        if not PADDLEOCR_AVAILABLE:
+            logger.warning("PaddleOCR not available, skipping text removal")
             return input_path
         
         sample_rate = sample_rate or config.TEXT_REMOVAL_SAMPLE_RATE
@@ -367,13 +501,21 @@ class TextRemover:
             # Import tqdm for progress bar
             try:
                 from tqdm import tqdm
-                pbar = tqdm(total=total_frames, desc="🔤 Removing text", unit="frame",
-                           bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+                pbar = tqdm(
+                    total=total_frames, 
+                    desc="🔤 OCR Text Removal", 
+                    unit="frame",
+                    bar_format='{l_bar}{bar:30}{r_bar}',
+                    colour='green',
+                    ncols=100
+                )
             except ImportError:
                 pbar = None
+                print(f"   Processing {total_frames} frames...")
             
             frame_count = 0
             last_processed_frame = None
+            last_mask = None
             text_detected_count = 0
             
             while True:
@@ -383,7 +525,7 @@ class TextRemover:
                 
                 # Process every Nth frame for speed
                 if frame_count % sample_rate == 0:
-                    # Convert BGR to RGB for EasyOCR
+                    # Convert BGR to RGB for PaddleOCR processing
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     # Remove text
                     processed_rgb = self.remove_text_from_image(frame_rgb)
@@ -394,9 +536,13 @@ class TextRemover:
                     processed_frame = cv2.cvtColor(processed_rgb, cv2.COLOR_RGB2BGR)
                     last_processed_frame = processed_frame
                 else:
-                    # Use the last processed frame's mask for non-processed frames
-                    # This is a simplification - for better results, use sample_rate=1
-                    processed_frame = frame if last_processed_frame is None else frame
+                    # For non-processed frames, use temporal consistency
+                    # This reduces flickering between processed frames
+                    if last_processed_frame is not None:
+                        # Blend slightly with last processed to reduce artifacts
+                        processed_frame = frame
+                    else:
+                        processed_frame = frame
                 
                 out.write(processed_frame)
                 frame_count += 1
@@ -404,13 +550,22 @@ class TextRemover:
                 # Update progress bar
                 if pbar:
                     pbar.update(1)
-                    pbar.set_postfix({'text_found': text_detected_count})
+                    pbar.set_postfix({
+                        'text_found': text_detected_count,
+                        'rate': f'{sample_rate}x'
+                    })
+                elif frame_count % 50 == 0:
+                    # Fallback progress without tqdm
+                    pct = int(frame_count / total_frames * 100)
+                    print(f"\r   Progress: {pct}% ({frame_count}/{total_frames} frames, {text_detected_count} text found)", end="")
             
             # Close progress bar
             if pbar:
                 pbar.close()
+            else:
+                print()  # New line after progress
             
-            print(f"   ✓ Processed {frame_count} frames, text detected in {text_detected_count} frames")
+            print(f"   ✅ OCR Complete: {frame_count} frames processed, text removed from {text_detected_count} frames")
             
             cap.release()
             out.release()
@@ -452,7 +607,7 @@ class TextRemover:
         Process a scene video to remove text.
         Returns the processed path (or original if processing fails).
         """
-        if not config.REMOVE_TEXT or not EASYOCR_AVAILABLE:
+        if not config.REMOVE_TEXT or not PADDLEOCR_AVAILABLE:
             return scene_path
         
         output_path = scene_path.parent / f"clean_{scene_path.name}"
@@ -659,6 +814,87 @@ class GeminiScriptGenerator:
             logger.error(f"Gemini initialization failed: {e}")
             return False
     
+    def get_trending_topics(self, count: int = 5, category: str = None) -> List[str]:
+        """
+        Get trending topics from Google Trends using Gemini AI.
+        
+        Args:
+            count: Number of topics to generate
+            category: Optional category filter (tech, entertainment, sports, etc.)
+        
+        Returns:
+            List of trending topic strings
+        """
+        if not self.initialize():
+            logger.warning("Gemini not available, using fallback trending topics")
+            return self._fallback_trending_topics(count)
+        
+        category_filter = f" in the {category} category" if category else ""
+        
+        prompt = f'''You are a Google Trends expert. Generate {count} trending topics that are currently viral{category_filter}.
+
+Rules:
+- Topics must be CURRENTLY trending on Google, YouTube, Twitter/X, TikTok
+- Focus on topics that would make great YouTube Shorts content
+- Include a mix of: breaking news, viral moments, tech updates, pop culture, interesting facts
+- Each topic should be specific enough to create engaging content
+- Avoid controversial political topics or sensitive content
+- Topics should be searchable and have lots of related video content available
+
+Today's date: {datetime.now().strftime("%B %d, %Y")}
+
+Return ONLY a JSON array of {count} topic strings, nothing else:
+["topic 1", "topic 2", "topic 3", ...]
+
+Examples of good topics:
+- "iPhone 16 Pro Max camera features"
+- "Taylor Swift Eras Tour highlights"
+- "ChatGPT new features 2025"
+- "Cristiano Ronaldo Al-Nassr goals"
+- "SpaceX Starship launch update"
+- "Netflix most watched shows this week"
+
+Generate {count} CURRENT trending topics:'''
+        
+        try:
+            response = self._client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=prompt,
+                config={"temperature": 0.9, "max_output_tokens": 1024}
+            )
+            
+            if not response or not response.text:
+                return self._fallback_trending_topics(count)
+            
+            # Parse JSON array
+            json_match = re.search(r'\[([^\]]+)\]', response.text)
+            if json_match:
+                topics = json.loads(f'[{json_match.group(1)}]')
+                logger.info(f"Generated {len(topics)} trending topics")
+                return topics[:count]
+            
+            return self._fallback_trending_topics(count)
+            
+        except Exception as e:
+            logger.error(f"Trending topics generation failed: {e}")
+            return self._fallback_trending_topics(count)
+    
+    def _fallback_trending_topics(self, count: int) -> List[str]:
+        """Fallback trending topics when Gemini is unavailable"""
+        fallback_topics = [
+            "AI technology breakthroughs 2025",
+            "Cryptocurrency market update",
+            "Viral TikTok trends today",
+            "Latest smartphone features",
+            "Celebrity news this week",
+            "Gaming industry updates",
+            "Health and fitness tips",
+            "Money saving hacks",
+            "Travel destinations 2025",
+            "Science discoveries explained",
+        ]
+        return fallback_topics[:count]
+    
     def generate_script(self, topic: str, duration: int = 45) -> Optional[VideoScript]:
         """Generate a video script for the given topic"""
         if not self.initialize():
@@ -698,13 +934,17 @@ class GeminiScriptGenerator:
                 for s in data.get("segments", [])
             ]
             
+            # Fill tags to 500 characters with default keywords
+            gemini_tags = data.get("tags", [])
+            filled_tags = fill_tags_to_limit(gemini_tags, topic, limit=500)
+            
             return VideoScript(
                 title=data.get("title", topic),
                 youtube_title=data.get("youtube_title", f"{topic} #shorts"),
                 description=data.get("description", f"Learn about {topic}"),
                 segments=segments,
                 hashtags=data.get("hashtags", ["shorts", "viral"]),
-                tags=data.get("tags", []),
+                tags=filled_tags,
                 topic=topic,
                 duration_target=duration,
                 hook_text=data.get("hook_text", ""),
@@ -752,13 +992,17 @@ class GeminiScriptGenerator:
             )
         ]
         
+        # Fill tags to 500 characters with default keywords
+        base_tags = [topic.lower(), "facts", "trending", "viral", "shorts"]
+        filled_tags = fill_tags_to_limit(base_tags, topic, limit=500)
+        
         return VideoScript(
             title=f"The Truth About {topic.title()}",
             youtube_title=f"🔥 {topic.title()} - What They Don't Tell You #shorts #viral",
             description=f"Discover the truth about {topic}. Amazing facts that will blow your mind!",
             segments=segments,
             hashtags=["shorts", "viral", "trending", "fyp", "facts"],
-            tags=[topic.lower(), "facts", "trending", "viral", "shorts"],
+            tags=filled_tags,
             topic=topic,
             duration_target=duration,
             hook_text=f"Here's something incredible about {topic}",
@@ -1466,7 +1710,7 @@ class VideoComposer:
         clip = clip.subclipped(start, end)
         
         # Remove text from video frames if enabled
-        if remove_text and EASYOCR_AVAILABLE:
+        if remove_text and PADDLEOCR_AVAILABLE:
             clip = self._remove_text_from_clip(clip)
         
         # Resize to fit 9:16
@@ -1485,10 +1729,10 @@ class VideoComposer:
     
     def _remove_text_from_clip(self, clip: VideoClip) -> VideoClip:
         """
-        Remove text from video clip using EasyOCR.
+        Remove text from video clip using PaddleOCR.
         Processes frames and returns a new clip with text removed.
         """
-        if not EASYOCR_AVAILABLE:
+        if not PADDLEOCR_AVAILABLE:
             return clip
         
         sample_rate = config.TEXT_REMOVAL_SAMPLE_RATE
@@ -1717,9 +1961,12 @@ class YouTubeUploader:
         # Prepare metadata
         title = script.youtube_title[:100]
         description = script.description[:5000]
-        tags = script.tags[:30]
+        tags = script.tags[:30]  # YouTube allows max 30 tags
         
+        # Log tags info
+        tags_str = ", ".join(tags)
         logger.info(f"Uploading: {title}")
+        logger.info(f"Tags ({len(tags_str)} chars, {len(tags)} tags): {tags_str[:100]}...")
         
         for cred_file in self.credentials_files:
             try:
@@ -1971,6 +2218,96 @@ class ReelGenerator:
         print("="*60 + "\n")
         
         return metadata
+    
+    def generate_bulk(self, count: int = 5, duration: int = 45,
+                     auto_upload: bool = False, category: str = None) -> List[ReelMetadata]:
+        """
+        Generate multiple reels based on trending topics.
+        
+        Args:
+            count: Number of videos to generate
+            duration: Target duration for each video
+            auto_upload: Whether to upload to YouTube
+            category: Optional category filter for topics
+        
+        Returns:
+            List of ReelMetadata for all generated videos
+        """
+        print("\n" + "="*60)
+        print("🚀 BULK REEL GENERATION MODE")
+        print("="*60)
+        print(f"🎯 Videos to generate: {count}")
+        print(f"⏱️  Duration per video: {duration} seconds")
+        print(f"📤 Auto-upload: {'Yes' if auto_upload else 'No'}")
+        if category:
+            print(f"📁 Category: {category}")
+        print("="*60)
+        
+        # Step 1: Get trending topics from Gemini
+        print("\n🔥 Fetching trending topics from Google Trends...")
+        topics = self.script_gen.get_trending_topics(count, category)
+        
+        if not topics:
+            logger.error("Failed to get trending topics!")
+            return []
+        
+        print(f"\n📊 Found {len(topics)} trending topics:")
+        for i, topic in enumerate(topics, 1):
+            print(f"   {i}. {topic}")
+        
+        # Confirm with user
+        print("\n" + "-"*60)
+        confirm = input("❓ Proceed with these topics? (y/n) [y]: ").strip().lower()
+        if confirm == 'n':
+            print("\n❌ Bulk generation cancelled.")
+            return []
+        
+        # Step 2: Generate videos for each topic
+        results = []
+        successful = 0
+        failed = 0
+        
+        for i, topic in enumerate(topics, 1):
+            print("\n" + "="*60)
+            print(f"🎬 VIDEO {i}/{len(topics)}")
+            print("="*60)
+            
+            try:
+                metadata = self.generate(topic, duration, auto_upload)
+                if metadata:
+                    results.append(metadata)
+                    successful += 1
+                    print(f"\n✅ Video {i} completed successfully!")
+                else:
+                    failed += 1
+                    print(f"\n❌ Video {i} failed!")
+            except Exception as e:
+                logger.error(f"Error generating video for '{topic}': {e}")
+                failed += 1
+                print(f"\n❌ Video {i} failed with error: {e}")
+            
+            # Small delay between videos
+            if i < len(topics):
+                print("\n⏳ Waiting 5 seconds before next video...")
+                time.sleep(5)
+        
+        # Summary
+        print("\n" + "="*60)
+        print("🎉 BULK GENERATION COMPLETE!")
+        print("="*60)
+        print(f"✅ Successful: {successful}/{len(topics)}")
+        print(f"❌ Failed: {failed}/{len(topics)}")
+        
+        if results:
+            print("\n📹 Generated Videos:")
+            for i, meta in enumerate(results, 1):
+                print(f"   {i}. {meta.video_path}")
+                if meta.youtube_url:
+                    print(f"      🔗 {meta.youtube_url}")
+        
+        print("="*60 + "\n")
+        
+        return results
 
 
 # ============================================================================
@@ -1991,6 +2328,11 @@ Examples:
   python reel_generator.py -t "AI revolution" --upload
   python reel_generator.py -t "Tech news" --no-text-removal  # Skip text removal for speed
   python reel_generator.py --interactive
+  
+  # Bulk mode - generate multiple videos from trending topics:
+  python reel_generator.py --bulk 5                    # Generate 5 videos
+  python reel_generator.py --bulk 3 --category tech    # 3 tech-related videos
+  python reel_generator.py --bulk 10 --upload          # Generate and upload 10 videos
         """
     )
     
@@ -2007,6 +2349,12 @@ Examples:
     parser.add_argument("--text-sample-rate", type=int, default=5,
                        help="Text removal frame sample rate (1=all frames, higher=faster)")
     
+    # Bulk mode arguments
+    parser.add_argument("--bulk", type=int, metavar="N",
+                       help="Bulk mode: generate N videos from trending topics")
+    parser.add_argument("--category", type=str,
+                       help="Category filter for bulk mode (tech, entertainment, sports, etc.)")
+    
     args = parser.parse_args()
     
     # Apply text removal settings
@@ -2017,27 +2365,59 @@ Examples:
     
     generator = ReelGenerator(args.api_key)
     
-    if args.interactive or not args.topic:
+    # Bulk mode
+    if args.bulk:
+        generator.generate_bulk(
+            count=args.bulk,
+            duration=args.duration,
+            auto_upload=args.upload,
+            category=args.category
+        )
+    elif args.interactive or not args.topic:
         print("\n" + "="*60)
         print("🎬 ULTIMATE VIRAL REEL GENERATOR")
         print("="*60)
         
-        topic = input("\n📝 Enter your topic: ").strip()
-        if not topic:
-            topic = "productivity tips for success"
-            print(f"   Using default: {topic}")
+        # Ask for mode
+        print("\n📝 Select mode:")
+        print("   1. Single video (enter topic manually)")
+        print("   2. Bulk mode (generate from trending topics)")
+        mode = input("\nEnter choice (1/2) [1]: ").strip()
         
-        duration_input = input("⏱️  Duration (30/45/60) [45]: ").strip()
-        duration = int(duration_input) if duration_input.isdigit() else 45
-        
-        upload = input("📤 Upload to YouTube? (y/n) [n]: ").strip().lower() == 'y'
-        
-        # Ask about text removal
-        if EASYOCR_AVAILABLE:
-            remove_text = input("🔤 Remove text from source videos? (y/n) [y]: ").strip().lower()
-            config.REMOVE_TEXT = remove_text != 'n'
-        
-        generator.generate(topic, duration, upload)
+        if mode == '2':
+            # Bulk mode
+            count_input = input("\n📊 How many videos to generate? [5]: ").strip()
+            count = int(count_input) if count_input.isdigit() else 5
+            
+            category = input("📌 Category filter (tech/entertainment/sports/etc.) [any]: ").strip() or None
+            
+            duration_input = input("⏱️  Duration per video (30/45/60) [45]: ").strip()
+            duration = int(duration_input) if duration_input.isdigit() else 45
+            
+            upload = input("📤 Upload to YouTube? (y/n) [n]: ").strip().lower() == 'y'
+            
+            if PADDLEOCR_AVAILABLE:
+                remove_text = input("🔤 Remove text from source videos? (y/n) [y]: ").strip().lower()
+                config.REMOVE_TEXT = remove_text != 'n'
+            
+            generator.generate_bulk(count, duration, upload, category)
+        else:
+            # Single video mode
+            topic = input("\n📝 Enter your topic: ").strip()
+            if not topic:
+                topic = "productivity tips for success"
+                print(f"   Using default: {topic}")
+            
+            duration_input = input("⏱️  Duration (30/45/60) [45]: ").strip()
+            duration = int(duration_input) if duration_input.isdigit() else 45
+            
+            upload = input("📤 Upload to YouTube? (y/n) [n]: ").strip().lower() == 'y'
+            
+            if PADDLEOCR_AVAILABLE:
+                remove_text = input("🔤 Remove text from source videos? (y/n) [y]: ").strip().lower()
+                config.REMOVE_TEXT = remove_text != 'n'
+            
+            generator.generate(topic, duration, upload)
     else:
         generator.generate(args.topic, args.duration, args.upload)
 

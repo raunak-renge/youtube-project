@@ -38,3 +38,7 @@ reel_output/video/*
 key.txt
 *.key
 secrets.txt
+.mediapipe_models/blaze_face_short_range.tflite
+reel_output_youtube/*
+.DS_Store
+.DS_Store
