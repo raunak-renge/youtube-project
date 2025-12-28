@@ -36,7 +36,7 @@ def install_packages():
         "google-auth-oauthlib",
         "google-auth-httplib2",
         "google-api-python-client",
-        "google-generativeai",
+        "google-genai",
         "mediapipe",
         "g4f",
     ]
@@ -53,7 +53,7 @@ def install_packages():
                 pkg_import = "google_auth_httplib2"
             elif pkg == "google-auth":
                 pkg_import = "google.auth"
-            elif pkg == "google-generativeai":
+            elif pkg == "google-genai":
                 pkg_import = "google.genai"
             elif pkg == "mediapipe":
                 pkg_import = "mediapipe"
@@ -109,14 +109,28 @@ except ImportError:
 # FACE DETECTION (MediaPipe) - Ensures faces aren't cut off in crops
 # ============================================================================
 
+# Try to import MediaPipe face detection (new tasks API)
+MEDIAPIPE_AVAILABLE = False
+try:
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    pass
+
+
 class FaceDetector:
     """
     Detect faces in images using MediaPipe to ensure faces aren't cut off
     when cropping images for 9:16 video format.
+    
+    Uses the new MediaPipe Tasks API (mediapipe >= 0.10).
+    Falls back gracefully if MediaPipe is unavailable.
     """
     
     _instance = None
     _detector = None
+    _model_path = None
     
     def __new__(cls):
         """Singleton pattern - reuse detector instance"""
@@ -125,15 +139,43 @@ class FaceDetector:
         return cls._instance
     
     def __init__(self):
-        if FaceDetector._detector is None:
+        if FaceDetector._detector is None and MEDIAPIPE_AVAILABLE:
             try:
-                FaceDetector._detector = mp.solutions.face_detection.FaceDetection(
-                    model_selection=1,  # 1 = full range model (better for various distances)
-                    min_detection_confidence=0.5
-                )
+                # Download model if needed
+                model_path = self._get_model_path()
+                if model_path:
+                    base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
+                    options = mp_vision.FaceDetectorOptions(
+                        base_options=base_options,
+                        min_detection_confidence=0.5
+                    )
+                    FaceDetector._detector = mp_vision.FaceDetector.create_from_options(options)
             except Exception as e:
                 print(f"    ⚠️ MediaPipe init failed: {e}")
                 FaceDetector._detector = None
+    
+    def _get_model_path(self) -> Optional[Path]:
+        """Download and cache the face detection model"""
+        if FaceDetector._model_path and FaceDetector._model_path.exists():
+            return FaceDetector._model_path
+        
+        model_dir = Config.BASE_DIR / ".mediapipe_models"
+        model_dir.mkdir(exist_ok=True)
+        model_path = model_dir / "blaze_face_short_range.tflite"
+        
+        if not model_path.exists():
+            try:
+                url = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+                response = requests.get(url, timeout=30)
+                response.raise_for_status()
+                with open(model_path, 'wb') as f:
+                    f.write(response.content)
+            except Exception as e:
+                print(f"    ⚠️ Could not download face detection model: {e}")
+                return None
+        
+        FaceDetector._model_path = model_path
+        return model_path
     
     def detect_faces(self, image_path: Path) -> List[Dict]:
         """
@@ -144,37 +186,43 @@ class FaceDetector:
         - 'center': (cx, cy) center point as fractions
         - 'confidence': detection confidence score
         """
-        if FaceDetector._detector is None:
+        if FaceDetector._detector is None or not MEDIAPIPE_AVAILABLE:
             return []
         
         try:
-            # Load image
-            img = Image.open(image_path).convert('RGB')
-            img_array = np.array(img)
+            # Load image using MediaPipe Image format
+            import mediapipe as mp
+            mp_image = mp.Image.create_from_file(str(image_path))
             
-            # Detect faces
-            results = FaceDetector._detector.process(img_array)
+            # Get image dimensions
+            img = Image.open(image_path)
+            img_w, img_h = img.size
+            
+            # Detect faces using new Tasks API
+            results = FaceDetector._detector.detect(mp_image)
             
             faces = []
-            if results.detections:
-                for detection in results.detections:
-                    bbox = detection.location_data.relative_bounding_box
-                    
-                    # Get bounding box (normalized 0-1)
-                    x = max(0, bbox.xmin)
-                    y = max(0, bbox.ymin)
-                    w = min(bbox.width, 1 - x)
-                    h = min(bbox.height, 1 - y)
-                    
-                    # Calculate center
-                    cx = x + w / 2
-                    cy = y + h / 2
-                    
-                    faces.append({
-                        'bbox': (x, y, w, h),
-                        'center': (cx, cy),
-                        'confidence': detection.score[0] if detection.score else 0.5
-                    })
+            for detection in results.detections:
+                bbox = detection.bounding_box
+                
+                # Convert pixel coordinates to normalized (0-1)
+                x = max(0, bbox.origin_x / img_w)
+                y = max(0, bbox.origin_y / img_h)
+                w = min(bbox.width / img_w, 1 - x)
+                h = min(bbox.height / img_h, 1 - y)
+                
+                # Calculate center
+                cx = x + w / 2
+                cy = y + h / 2
+                
+                # Get confidence score
+                confidence = detection.categories[0].score if detection.categories else 0.5
+                
+                faces.append({
+                    'bbox': (x, y, w, h),
+                    'center': (cx, cy),
+                    'confidence': confidence
+                })
             
             return faces
             
@@ -284,6 +332,23 @@ def get_face_detector() -> FaceDetector:
     if _face_detector is None:
         _face_detector = FaceDetector()
     return _face_detector
+
+def cleanup_face_detector():
+    """Clean up and release MediaPipe resources to prevent multiprocessing issues"""
+    global _face_detector
+    if _face_detector is not None:
+        try:
+            _face_detector.close()
+        except:
+            pass
+        _face_detector = None
+    # Also clean up class-level detector
+    if FaceDetector._detector is not None:
+        try:
+            FaceDetector._detector.close()
+        except:
+            pass
+        FaceDetector._detector = None
 
 
 # ============================================================================
@@ -423,8 +488,10 @@ class WordTranscriber:
     def transcribe(self, audio_path: Path, original_text: str = None) -> List[Dict]:
         """
         Transcribe audio and return word-level timestamps.
-        If original_text is provided, aligns Whisper output with it.
         Returns: List of {"word": str, "start": float, "end": float}
+        
+        Note: We use Whisper's raw transcription directly without alignment
+        as alignment can sometimes cause incorrect word matching.
         """
         try:
             result = self.model.transcribe(
@@ -441,177 +508,10 @@ class WordTranscriber:
                         'end': word_info['end']
                     })
             
-            # Align with original text if provided
-            if original_text and words:
-                words = self.align_with_original(words, original_text)
-            
             return words
         except Exception as e:
             print(f"    ⚠️ Whisper transcription error: {e}")
             return []
-    
-    def align_with_original(self, whisper_words: List[Dict], original_text: str) -> List[Dict]:
-        """
-        Align Whisper transcription with original narration text.
-        
-        ROBUST ALGORITHM:
-        - Keep Whisper's word COUNT and TIMING exactly as-is
-        - Only CORRECT SPELLINGS by finding best matching original word
-        - Never alter the sequence of words
-        - Handle cases where Whisper has more or fewer words than original
-        
-        Returns: List with corrected spellings but original Whisper timestamps
-        """
-        if not whisper_words:
-            return []
-        
-        if not original_text:
-            return whisper_words
-        
-        # Tokenize original text
-        original_words = self._tokenize_text(original_text)
-        
-        if not original_words:
-            return whisper_words
-        
-        # Create aligned result - same length as whisper_words
-        aligned = []
-        
-        # Track which original words we've used
-        used_original = [False] * len(original_words)
-        
-        for w_idx, whisper_word in enumerate(whisper_words):
-            whisper_text = whisper_word['word']
-            whisper_norm = self._normalize_word(whisper_text)
-            
-            # Find the best matching original word
-            best_match_idx = -1
-            best_similarity = 0.0
-            
-            # Search in a window around the expected position
-            # Expected position based on proportional mapping
-            expected_pos = int((w_idx / len(whisper_words)) * len(original_words))
-            
-            # Search window: prefer nearby words, but check all if needed
-            search_order = self._get_search_order(expected_pos, len(original_words))
-            
-            for orig_idx in search_order:
-                if used_original[orig_idx]:
-                    continue
-                
-                orig_word = original_words[orig_idx]
-                similarity = self._word_similarity(whisper_text, orig_word)
-                
-                # Prefer exact matches or very high similarity
-                if similarity > best_similarity:
-                    best_similarity = similarity
-                    best_match_idx = orig_idx
-                
-                # If we found an exact match, stop searching
-                if similarity >= 0.95:
-                    break
-            
-            # Determine which word to use
-            if best_match_idx >= 0 and best_similarity >= 0.4:
-                # Good match found - use original spelling with Whisper timing
-                corrected_word = original_words[best_match_idx]
-                used_original[best_match_idx] = True
-            else:
-                # No good match - keep Whisper's word as-is
-                corrected_word = whisper_text
-            
-            aligned.append({
-                'word': corrected_word,
-                'start': whisper_word['start'],
-                'end': whisper_word['end']
-            })
-        
-        return aligned
-    
-    def _get_search_order(self, expected_pos: int, total_len: int) -> List[int]:
-        """
-        Generate search order starting from expected position, expanding outward.
-        This prioritizes finding matches near the expected position.
-        """
-        order = []
-        # Start at expected position, then alternate left and right
-        left = expected_pos
-        right = expected_pos + 1
-        
-        while left >= 0 or right < total_len:
-            if left >= 0:
-                order.append(left)
-                left -= 1
-            if right < total_len:
-                order.append(right)
-                right += 1
-        
-        return order
-    
-    def _tokenize_text(self, text: str) -> List[str]:
-        """Tokenize text into words, preserving punctuation attached to words"""
-        # Remove extra whitespace and split
-        text = ' '.join(text.split())
-        # Split on whitespace but keep contractions together
-        words = []
-        for word in text.split():
-            # Clean but preserve the word
-            cleaned = word.strip()
-            if cleaned:
-                words.append(cleaned)
-        return words
-    
-    def _normalize_word(self, word: str) -> str:
-        """Normalize word for comparison (lowercase, remove punctuation)"""
-        return re.sub(r'[^\w\s]', '', word.lower()).strip()
-    
-    def _word_similarity(self, word1: str, word2: str) -> float:
-        """
-        Calculate similarity between two words (0 to 1).
-        Uses multiple methods for robust matching.
-        """
-        w1 = self._normalize_word(word1)
-        w2 = self._normalize_word(word2)
-        
-        # Exact match
-        if w1 == w2:
-            return 1.0
-        
-        # Empty check
-        if not w1 or not w2:
-            return 0.0
-        
-        # One contains the other (handles contractions, suffixes)
-        if w1 in w2 or w2 in w1:
-            return 0.85
-        
-        # Same first letter and similar length (likely same word)
-        if w1[0] == w2[0] and abs(len(w1) - len(w2)) <= 2:
-            # Calculate Levenshtein-like ratio
-            matches = sum(1 for c1, c2 in zip(w1, w2) if c1 == c2)
-            max_len = max(len(w1), len(w2))
-            ratio = matches / max_len
-            if ratio >= 0.6:
-                return 0.7 + (ratio * 0.2)
-        
-        # Check for common transcription errors
-        # Numbers: "70,000" vs "seventy thousand"
-        # We'll handle these by checking if both represent numbers
-        
-        # Character-level similarity (Levenshtein ratio approximation)
-        # Count matching characters in order
-        matches = 0
-        j = 0
-        for c in w1:
-            while j < len(w2):
-                if w2[j] == c:
-                    matches += 1
-                    j += 1
-                    break
-                j += 1
-        
-        max_len = max(len(w1), len(w2))
-        return matches / max_len if max_len > 0 else 0.0
 
 
 # ============================================================================
@@ -1399,7 +1299,7 @@ NOW CREATE: Write the complete engaging script for "{topic}" ({duration} seconds
 # ============================================================================
 
 class GeminiClient:
-    """Client for interacting with Google Gemini AI API (new google.genai package)"""
+    """Client for interacting with Google Gemini AI API (google-genai package)"""
     
     def __init__(self, model: str = None):
         self.model_name = model or Config.GEMINI_MODEL
@@ -2002,6 +1902,7 @@ class VoiceGenerator:
     def _concatenate_audio_files(self, audio_files: List[Path], output_path: Path) -> Optional[Path]:
         """
         Concatenate multiple audio files into one using ffmpeg.
+        Re-encodes to ensure consistent format across all files.
         """
         if not audio_files:
             return None
@@ -2012,7 +1913,37 @@ class VoiceGenerator:
             shutil.copy(audio_files[0], output_path)
             return output_path
         
-        # Create a temporary file list for ffmpeg
+        # Method 1: Try filter_complex concat (more reliable for different formats)
+        try:
+            # Build filter_complex string for concat
+            inputs = []
+            filter_parts = []
+            
+            for i, audio in enumerate(audio_files):
+                inputs.extend(["-i", str(audio)])
+                filter_parts.append(f"[{i}:a]")
+            
+            # Normalize audio volume with loudnorm filter for consistent levels
+            filter_complex = f"{''.join(filter_parts)}concat=n={len(audio_files)}:v=0:a=1[concat];[concat]loudnorm=I=-16:TP=-1.5:LRA=11[outa]"
+            
+            cmd = [
+                "ffmpeg", "-y",
+                *inputs,
+                "-filter_complex", filter_complex,
+                "-map", "[outa]",
+                "-ar", "24000",  # Standard sample rate
+                "-ac", "1",      # Mono
+                str(output_path)
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, timeout=120)
+            
+            if result.returncode == 0 and output_path.exists():
+                return output_path
+        except Exception as e:
+            pass  # Try fallback method
+        
+        # Method 2: Fallback to concat demuxer with re-encoding
         list_file = output_path.parent / f"concat_list_{random.randint(1000, 9999)}.txt"
         try:
             with open(list_file, 'w') as f:
@@ -2021,30 +1952,75 @@ class VoiceGenerator:
                     safe_path = str(audio).replace("'", "'\\''")
                     f.write(f"file '{safe_path}'\n")
             
-            # Run ffmpeg concat
+            # Re-encode with loudnorm for consistent volume
             cmd = [
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", str(list_file), "-c", "copy", str(output_path)
+                "-i", str(list_file),
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",  # Normalize volume
+                "-ar", "24000",  # Standard sample rate
+                "-ac", "1",      # Mono
+                "-acodec", "pcm_s16le",  # Standard WAV format
+                str(output_path)
             ]
             result = subprocess.run(cmd, capture_output=True, timeout=120)
             
             if result.returncode == 0 and output_path.exists():
                 return output_path
             else:
-                print(f"    ⚠ Concat failed, using first sentence only")
-                import shutil
-                shutil.copy(audio_files[0], output_path)
-                return output_path
+                # Last resort: use scipy to concatenate
+                return self._concatenate_with_scipy(audio_files, output_path)
                 
         except Exception as e:
             print(f"    ⚠ Concat error: {e}")
-            return None
+            return self._concatenate_with_scipy(audio_files, output_path)
         finally:
             list_file.unlink(missing_ok=True)
             # Clean up temp sentence files
             for audio in audio_files:
-                if "_sent_" in str(audio):
+                if "_sent_" in str(audio) or "temp_sent_" in str(audio):
                     audio.unlink(missing_ok=True)
+    
+    def _concatenate_with_scipy(self, audio_files: List[Path], output_path: Path) -> Optional[Path]:
+        """
+        Fallback: Concatenate audio files using scipy (pure Python).
+        """
+        try:
+            import soundfile as sf
+            import numpy as np
+            
+            all_audio = []
+            sample_rate = None
+            
+            for audio_path in audio_files:
+                data, sr = sf.read(str(audio_path))
+                if sample_rate is None:
+                    sample_rate = sr
+                elif sr != sample_rate:
+                    # Resample if needed (simple linear interpolation)
+                    from scipy import signal
+                    num_samples = int(len(data) * sample_rate / sr)
+                    data = signal.resample(data, num_samples)
+                
+                # Ensure mono
+                if len(data.shape) > 1:
+                    data = data.mean(axis=1)
+                
+                all_audio.append(data)
+            
+            # Concatenate all audio
+            combined = np.concatenate(all_audio)
+            
+            # Write output
+            sf.write(str(output_path), combined, sample_rate)
+            return output_path
+            
+        except Exception as e:
+            print(f"    ⚠ Scipy concat failed: {e}, using first file")
+            import shutil
+            if audio_files:
+                shutil.copy(audio_files[0], output_path)
+                return output_path
+            return None
     
     def generate_audio_sentence_by_sentence(self, text: str, output_path: Path,
                                             voice: str = None, emotion: str = "neutral") -> Optional[Path]:
@@ -2253,6 +2229,10 @@ class VideoComposer:
             media_types: List of "video" or "image" for each segment
         """
         print("\n🎥 Composing video with animated captions...")
+        
+        # CRITICAL: Close MediaPipe detector before MoviePy multiprocessing
+        # This prevents "pointer being freed was not allocated" malloc errors on macOS
+        cleanup_face_detector()
         
         # Default media types to "image" if not provided
         if media_types is None:
@@ -2504,12 +2484,15 @@ class VideoComposer:
             shutil.copy(video, output)
             return True
         
+        # Use dynaudnorm for consistent volume throughout, then mix with normalized music
         cmd = [
             "ffmpeg", "-y",
             "-i", video, "-i", music,
             "-filter_complex",
+            f"[0:a]loudnorm=I=-16:TP=-1.5:LRA=11[voice];"
             f"[1:a]volume={Config.MUSIC_VOLUME},aloop=loop=-1:size=2e9[m];"
-            f"[0:a][m]amix=inputs=2:duration=first:dropout_transition=2",
+            f"[voice][m]amix=inputs=2:duration=first:dropout_transition=0:weights=1 0.3:normalize=0[out]",
+            "-map", "0:v", "-map", "[out]",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
             output
         ]
@@ -2530,7 +2513,8 @@ class VideoComposer:
             filters.append(f"[{i+1}:a]volume={Config.CLICK_VOLUME},adelay={int(t*1000)}|{int(t*1000)}[c{i}]")
         
         mix = "[0:a]" + "".join(f"[c{i}]" for i in range(len(times)))
-        filters.append(f"{mix}amix=inputs={len(times)+1}:duration=first[out]")
+        # Use normalize=0 to prevent volume from increasing with each click
+        filters.append(f"{mix}amix=inputs={len(times)+1}:duration=first:normalize=0[out]")
         
         cmd = ["ffmpeg", "-y"] + inputs + [
             "-filter_complex", ";".join(filters),
@@ -2564,6 +2548,8 @@ class YouTubeUploader:
     YouTube video uploader with multi-credential failover support.
     Reads OAuth credentials from google-console folder and retries with
     different credentials if one fails.
+    
+    Tracks quota-exceeded credentials to skip them on subsequent attempts.
     """
     
     # Trending hashtags for Shorts (SEO optimized)
@@ -2584,10 +2570,41 @@ class YouTubeUploader:
         "celebrity": ["celebrity", "famous", "star", "hollywood", "gossip", "news", "breaking"],
     }
     
+    # Track quota-exceeded credentials (resets daily)
+    _quota_exceeded_file = Config.GOOGLE_CONSOLE_DIR / ".quota_exceeded.json"
+    
     def __init__(self):
         self.credentials_files = self._get_credential_files()
         self.current_cred_index = 0
         self.youtube_service = None
+        self._quota_exceeded = self._load_quota_exceeded()
+        
+    def _load_quota_exceeded(self) -> Dict[str, str]:
+        """Load quota exceeded tracking file"""
+        if not self._quota_exceeded_file.exists():
+            return {}
+        try:
+            with open(self._quota_exceeded_file, 'r') as f:
+                data = json.load(f)
+            # Clear entries older than 24 hours
+            today = datetime.now().strftime("%Y-%m-%d")
+            return {k: v for k, v in data.items() if v == today}
+        except:
+            return {}
+    
+    def _save_quota_exceeded(self, cred_name: str):
+        """Mark a credential as quota-exceeded for today"""
+        self._quota_exceeded[cred_name] = datetime.now().strftime("%Y-%m-%d")
+        try:
+            with open(self._quota_exceeded_file, 'w') as f:
+                json.dump(self._quota_exceeded, f)
+        except:
+            pass
+    
+    def _is_quota_exceeded(self, cred_file: Path) -> bool:
+        """Check if credential has exceeded quota today"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        return self._quota_exceeded.get(cred_file.name, "") == today
         
     def _get_credential_files(self) -> List[Path]:
         """Get all OAuth credential JSON files from google-console folder"""
@@ -2814,10 +2831,22 @@ class YouTubeUploader:
         if thumbnail_path and Path(thumbnail_path).exists():
             print(f"   🖼️  Thumbnail: {Path(thumbnail_path).name}")
         
+        # Filter out quota-exceeded credentials
+        available_creds = [c for c in self.credentials_files if not self._is_quota_exceeded(c)]
+        skipped_count = len(self.credentials_files) - len(available_creds)
+        
+        if skipped_count > 0:
+            print(f"   ⏭️  Skipping {skipped_count} credential(s) that hit quota today")
+        
+        if not available_creds:
+            return False, "All credentials have exceeded their daily upload quota. Try again tomorrow or add new YouTube accounts."
+        
         # Try each credential file until success
         last_error = ""
-        for i, cred_file in enumerate(self.credentials_files):
-            print(f"\n   🔑 Trying credential {i+1}/{len(self.credentials_files)}: {cred_file.name[:30]}...")
+        all_quota_exceeded = True
+        
+        for i, cred_file in enumerate(available_creds):
+            print(f"\n   🔑 Trying credential {i+1}/{len(available_creds)}: {cred_file.name[:30]}...")
             
             try:
                 service = self._get_authenticated_service(cred_file)
@@ -2902,17 +2931,31 @@ class YouTubeUploader:
                 return True, video_id
                 
             except HttpError as e:
-                last_error = f"HTTP Error: {e.resp.status} - {e.content.decode()[:100]}"
+                error_content = e.content.decode() if e.content else ""
+                last_error = f"HTTP Error: {e.resp.status} - {error_content[:100]}"
                 print(f"   ❌ {last_error}")
                 
-                # Check if quota exceeded - try next credential
-                if e.resp.status == 403 and 'quotaExceeded' in str(e.content):
-                    print(f"   ⚠️ Quota exceeded, trying next credential...")
+                # Check if quota/upload limit exceeded - mark credential and try next
+                if e.resp.status == 400 and ('exceeded' in error_content.lower() or 'quota' in error_content.lower()):
+                    print(f"   ⚠️ Upload limit exceeded for this account, marking and trying next...")
+                    self._save_quota_exceeded(cred_file.name)
                     continue
+                    
+                if e.resp.status == 403 and 'quotaExceeded' in error_content:
+                    print(f"   ⚠️ API quota exceeded, marking and trying next...")
+                    self._save_quota_exceeded(cred_file.name)
+                    continue
+                
+                # Other errors - still try next credential
+                all_quota_exceeded = False
                     
             except Exception as e:
                 last_error = str(e)
                 print(f"   ❌ Error: {last_error}")
+                all_quota_exceeded = False
+        
+        if all_quota_exceeded:
+            return False, "All YouTube accounts have exceeded their daily upload limit. Try again tomorrow (quota resets at midnight Pacific Time)."
         
         return False, f"All credentials failed. Last error: {last_error}"
     
@@ -2926,8 +2969,10 @@ class YouTubeUploader:
             return {"error": "Scripts directory not found"}
         
         # Find all script files with uploaded: false
+        # Match both old (script_*) and new (reel_*) naming conventions
         pending = []
-        for script_file in scripts_dir.glob("script_*.json"):
+        script_files = list(scripts_dir.glob("script_*.json")) + list(scripts_dir.glob("reel_*.json"))
+        for script_file in script_files:
             try:
                 with open(script_file, 'r') as f:
                     script = json.load(f)
@@ -3360,7 +3405,7 @@ class ReelDesigner:
     
     def create_reel(self, topic: str, duration: int = 45, 
                     voice: str = None, add_captions: bool = True,
-                    whisper_model: str = "base", auto_upload: bool = True,
+                    whisper_model: str = "turbo", auto_upload: bool = True,
                     force_fallback: bool = False) -> Path:
         """Create a complete reel from topic to video with word-by-word captions"""
         voice = voice or Config.TTS_VOICE
@@ -3610,6 +3655,8 @@ Examples:
   python main.py -t "Elon Musk" --no-upload # Create without uploading
   python main.py --upload-pending          # Upload all pending videos
   python main.py --list-pending            # List pending uploads
+  python main.py --quota-status            # Check YouTube quota status
+  python main.py --reset-quota             # Reset quota tracking (use after midnight)
 
 Note: Requires Gemini API key in key.txt file (format: geminikey="YOUR_API_KEY")
         """
@@ -3627,6 +3674,8 @@ Note: Requires Gemini API key in key.txt file (format: geminikey="YOUR_API_KEY")
     parser.add_argument("--no-upload", action="store_true", help="Disable auto-upload to YouTube (default: auto-upload enabled)")
     parser.add_argument("--upload-pending", action="store_true", help="Upload all pending videos")
     parser.add_argument("--list-pending", action="store_true", help="List all pending (not uploaded) videos")
+    parser.add_argument("--quota-status", action="store_true", help="Check YouTube quota status for all credentials")
+    parser.add_argument("--reset-quota", action="store_true", help="Reset quota tracking (use after midnight Pacific Time)")
     
     args = parser.parse_args()
     
@@ -3637,6 +3686,43 @@ Note: Requires Gemini API key in key.txt file (format: geminikey="YOUR_API_KEY")
     Config.TTS_SPEED = args.speed
     
     designer = ReelDesigner()
+    
+    # Handle quota commands
+    if args.quota_status:
+        print("\n" + "="*60)
+        print("📊 YOUTUBE QUOTA STATUS")
+        print("="*60)
+        uploader = YouTubeUploader()
+        total = len(uploader.credentials_files)
+        exceeded = len([c for c in uploader.credentials_files if uploader._is_quota_exceeded(c)])
+        available = total - exceeded
+        
+        print(f"\n📁 Total credentials: {total}")
+        print(f"✅ Available: {available}")
+        print(f"❌ Quota exceeded today: {exceeded}")
+        
+        if exceeded > 0:
+            print(f"\n⚠️  Credentials that hit quota today:")
+            for cred in uploader.credentials_files:
+                if uploader._is_quota_exceeded(cred):
+                    print(f"   • {cred.name}")
+            print(f"\n💡 Tip: Quota resets at midnight Pacific Time")
+            print(f"   Run 'python main.py --reset-quota' after midnight to clear")
+        else:
+            print(f"\n✅ All credentials available for upload!")
+        return
+    
+    if args.reset_quota:
+        print("\n" + "="*60)
+        print("🔄 RESETTING QUOTA TRACKING")
+        print("="*60)
+        quota_file = Config.GOOGLE_CONSOLE_DIR / ".quota_exceeded.json"
+        if quota_file.exists():
+            quota_file.unlink()
+            print("✅ Quota tracking reset! All credentials now available.")
+        else:
+            print("✅ No quota tracking to reset.")
+        return
     
     # Handle upload-only commands
     if args.upload_pending:
