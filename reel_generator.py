@@ -1363,15 +1363,36 @@ class KokoroTTSEngine:
         output_dir.mkdir(parents=True, exist_ok=True)
         results = []
         
+        # Progress bar for voice generation
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(
+                total=len(script.segments),
+                desc="🎤 Generating Voice",
+                unit="segment",
+                bar_format='{l_bar}{bar:30}{r_bar}',
+                colour='cyan',
+                ncols=100
+            )
+        except ImportError:
+            pbar = None
+        
         for i, segment in enumerate(script.segments):
             audio_path = output_dir / f"segment_{i:02d}.wav"  # Kokoro outputs WAV
             
             if self.generate(segment.text, audio_path):
                 duration = self._get_audio_duration(audio_path)
                 results.append((audio_path, duration))
-                logger.info(f"Generated audio {i+1}/{len(script.segments)}: {duration:.2f}s")
+                if pbar:
+                    pbar.set_postfix({'duration': f'{duration:.1f}s'})
             else:
                 results.append((None, segment.duration_hint))
+            
+            if pbar:
+                pbar.update(1)
+        
+        if pbar:
+            pbar.close()
         
         return results
     
@@ -1623,10 +1644,26 @@ class VideoComposer:
         clips = []
         current_time = 0
         
+        # Progress bar for video composition
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(
+                total=len(audio_files),
+                desc="🎬 Composing Video",
+                unit="segment",
+                bar_format='{l_bar}{bar:30}{r_bar}',
+                colour='magenta',
+                ncols=100
+            )
+        except ImportError:
+            pbar = None
+        
         for i, ((audio_path, audio_duration), scene, words) in enumerate(
             zip(audio_files, scenes, word_timestamps)):
             
             if audio_path is None:
+                if pbar:
+                    pbar.update(1)
                 continue
             
             # Load and process video scene
@@ -1652,11 +1689,17 @@ class VideoComposer:
                 clips.append(video_clip)
                 current_time += audio_duration
                 
-                logger.info(f"Processed segment {i+1}/{len(audio_files)}")
+                if pbar:
+                    pbar.set_postfix({'duration': f'{current_time:.1f}s'})
                 
             except Exception as e:
                 logger.error(f"Error processing segment {i}: {e}")
-                continue
+            
+            if pbar:
+                pbar.update(1)
+        
+        if pbar:
+            pbar.close()
         
         if not clips:
             logger.error("No clips to compose!")
@@ -2011,12 +2054,33 @@ class YouTubeUploader:
                 # Upload thumbnail
                 if thumbnail_path and thumbnail_path.exists():
                     try:
+                        logger.info(f"Uploading thumbnail: {thumbnail_path}")
                         service.thumbnails().set(
                             videoId=video_id,
-                            media_body=MediaFileUpload(str(thumbnail_path))
+                            media_body=MediaFileUpload(
+                                str(thumbnail_path),
+                                mimetype='image/jpeg'
+                            )
                         ).execute()
-                    except:
-                        pass
+                        logger.info("✅ Thumbnail uploaded successfully")
+                    except HttpError as e:
+                        logger.warning(f"Thumbnail upload failed (HTTP): {e}")
+                        # Try with different mimetype
+                        try:
+                            service.thumbnails().set(
+                                videoId=video_id,
+                                media_body=MediaFileUpload(
+                                    str(thumbnail_path),
+                                    mimetype='image/png'
+                                )
+                            ).execute()
+                            logger.info("✅ Thumbnail uploaded (PNG format)")
+                        except Exception as e2:
+                            logger.warning(f"Thumbnail retry failed: {e2}")
+                    except Exception as e:
+                        logger.warning(f"Thumbnail upload failed: {e}")
+                else:
+                    logger.warning(f"Thumbnail not found or path invalid: {thumbnail_path}")
                 
                 return True, video_id
                 
