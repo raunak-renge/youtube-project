@@ -3359,6 +3359,81 @@ class ReelDesigner:
         
         return requirements
     
+    def select_thumbnail(self, video_base_name: str) -> Optional[Path]:
+        """
+        Let user select a thumbnail from existing thumbnails or generate a new one.
+        
+        Args:
+            video_base_name: Base name for the video (used if generating new thumbnail)
+        
+        Returns:
+            Path to selected or generated thumbnail
+        """
+        thumbnails_dir = Config.THUMBNAIL_DIR
+        
+        # Get list of existing thumbnails
+        existing_thumbs = []
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
+            existing_thumbs.extend(thumbnails_dir.glob(ext))
+        
+        # Sort by modification time (newest first)
+        existing_thumbs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        
+        print("\n" + "="*60)
+        print("🖼️  THUMBNAIL SELECTION")
+        print("="*60)
+        print(f"📁 Thumbnails folder: {thumbnails_dir}")
+        print("\n   Choose an option:")
+        print("   [1] Generate new AI thumbnail (default)")
+        print("   [2] Extract frame from video")
+        
+        if existing_thumbs:
+            print(f"   [3] Select from existing thumbnails ({len(existing_thumbs)} available)")
+            print("\n   📷 Recent thumbnails:")
+            for i, thumb in enumerate(existing_thumbs[:15], 1):
+                size_kb = thumb.stat().st_size / 1024
+                mtime = datetime.fromtimestamp(thumb.stat().st_mtime).strftime('%Y-%m-%d %H:%M')
+                print(f"      {i:2d}. {thumb.name} ({size_kb:.1f} KB, {mtime})")
+            if len(existing_thumbs) > 15:
+                print(f"      ... and {len(existing_thumbs) - 15} more")
+        
+        print("\n   [s] Skip thumbnail (no thumbnail)")
+        
+        choice = input("\n   Enter choice [1/2/3/s] (press Enter for default): ").strip().lower()
+        
+        if choice == 's':
+            print("   ⏭️  Skipping thumbnail")
+            return None
+        
+        elif choice == '3' and existing_thumbs:
+            # Select from existing
+            print(f"\n   📋 Enter thumbnail number (1-{min(len(existing_thumbs), 15)}) or filename:")
+            selection = input("   > ").strip()
+            
+            if not selection:
+                print("   ⚠️  No selection made, generating new thumbnail...")
+                return None
+            
+            try:
+                # Try as number first
+                idx = int(selection) - 1
+                if 0 <= idx < len(existing_thumbs):
+                    selected = existing_thumbs[idx]
+                    print(f"   ✓ Selected: {selected.name}")
+                    return selected
+            except ValueError:
+                # Try as filename
+                for thumb in existing_thumbs:
+                    if selection.lower() in thumb.name.lower():
+                        print(f"   ✓ Selected: {thumb.name}")
+                        return thumb
+            
+            print("   ⚠️  Invalid selection, will generate new thumbnail...")
+            return None
+        
+        # For options 1, 2, or invalid choice, return None to trigger generation
+        return None
+    
     def interactive_mode(self):
         """Run in interactive mode"""
         print("\n" + "="*60)
@@ -3566,18 +3641,26 @@ class ReelDesigner:
             script['video_file_path'] = str(final_video.absolute())
             script['video_filename'] = final_video.name
             
-            # Step 5: Generate thumbnail using g4f (with Gemini prompts)
-            thumbnail_path = self.thumbnail_gen.generate_thumbnail(
-                topic=topic,
-                title=script.get('video_title', script.get('title', topic)),
-                video_path=final_video,
-                output_name=video_base_name
-            )
+            # Step 5: Thumbnail selection or generation
+            print("\n" + "="*60)
+            thumbnail_path = self.select_thumbnail(video_base_name)
+            
+            # If no thumbnail selected, generate one
+            if thumbnail_path is None:
+                print("🎨 Generating new thumbnail with AI...")
+                thumbnail_path = self.thumbnail_gen.generate_thumbnail(
+                    topic=topic,
+                    title=script.get('video_title', script.get('title', topic)),
+                    video_path=final_video,
+                    output_name=video_base_name
+                )
             
             if thumbnail_path:
                 script['thumbnail_path'] = str(thumbnail_path.absolute())
                 script['thumbnail_filename'] = thumbnail_path.name
-                print(f"🖼️  Thumbnail: {thumbnail_path}")
+                print(f"✅ Thumbnail ready: {thumbnail_path.name}")
+            else:
+                print("⚠️  No thumbnail available")
             
             # Save updated script to both locations
             with open(script_path, 'w') as f:
