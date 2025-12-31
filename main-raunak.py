@@ -994,11 +994,16 @@ class AnimatedCaptions:
     
     def _get_grouped_words(self, words: List[Dict]) -> List[Dict]:
         """Get or create grouped words (cached)"""
-        # Create a simple hash for caching
-        cache_key = len(words)
+        # Create a unique cache key using word content and timings
+        # This prevents the bug where segments with same word count would share cached captions
+        cache_key = tuple((w.get('word', ''), round(w.get('start', 0), 3)) for w in words)
         if cache_key not in self._grouped_cache:
             self._grouped_cache[cache_key] = SmartPhraseGrouper.group_words_for_display(words)
         return self._grouped_cache[cache_key]
+    
+    def clear_cache(self):
+        """Clear the grouped words cache - call this between segments"""
+        self._grouped_cache = {}
     
     def create_caption_frame(self, words: List[Dict], current_time: float) -> np.ndarray:
         """
@@ -2279,6 +2284,8 @@ class VideoComposer:
             
             # Add word-by-word captions overlay
             if add_captions and all_word_data[-1]:
+                # Clear caption cache to prevent stale captions from previous segments
+                self.captions.clear_cache()
                 caption_clip = self._create_caption_clip(all_word_data[-1], duration)
                 video_clip = CompositeVideoClip([video_clip, caption_clip])
             
@@ -3783,6 +3790,7 @@ Note: Requires Gemini API key in key.txt file (format: geminikey="YOUR_API_KEY")
     
     # Update config if specified
     Config.TTS_SPEED = args.speed
+    
     
     designer = ReelDesigner()
     

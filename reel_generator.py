@@ -1233,6 +1233,11 @@ class SceneAnalyzer:
             for scene in scene_list:
                 scene_pool.append((term, scene))
         
+        # If no scenes available, log warning and return empty
+        if not scene_pool:
+            logger.warning("No scenes available in pool! Video download may have failed.")
+            return []
+        
         for duration in segment_durations:
             best_scene = None
             best_score = float('inf')
@@ -1259,13 +1264,11 @@ class SceneAnalyzer:
                 selected.append(best_scene)
                 used_scenes.add((best_scene.video_path, best_scene.start_time))
             else:
-                # Use any available scene
-                for term, scene in scene_pool:
-                    scene_key = (scene.video_path, scene.start_time)
-                    if scene_key not in used_scenes:
-                        selected.append(scene)
-                        used_scenes.add(scene_key)
-                        break
+                # Try to reuse any available scene if we ran out
+                if scene_pool:
+                    term, scene = scene_pool[0]
+                    selected.append(scene)
+                    logger.warning(f"Reusing scene for segment (no unused scenes left)")
         
         return selected
 
@@ -2178,11 +2181,23 @@ class ReelGenerator:
         total_videos = sum(len(v) for v in videos.values())
         print(f"   ✓ Downloaded {total_videos} videos")
         
+        # Check if any videos were downloaded
+        if total_videos == 0:
+            logger.error("No videos downloaded! Cannot proceed.")
+            print("   ❌ Failed to download any videos. Skipping this topic.")
+            return None
+        
         # Step 3: Analyze Scenes
         print("\n🎬 Step 3: Analyzing Scenes with PySceneDetect...")
         all_scenes = self.scene_analyzer.analyze_videos(videos)
         total_scenes = sum(len(s) for s in all_scenes.values())
         print(f"   ✓ Detected {total_scenes} scenes")
+        
+        # Check if any scenes were detected
+        if total_scenes == 0:
+            logger.error("No scenes detected! Cannot proceed.")
+            print("   ❌ Failed to detect any scenes. Skipping this topic.")
+            return None
         
         # Step 4: Generate Audio
         print("\n🎤 Step 4: Generating Voice Narration...")

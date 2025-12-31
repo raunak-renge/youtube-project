@@ -42,3 +42,4 @@ secrets.txt
 reel_output_youtube/*
 .DS_Store
 .DS_Store
+token.pickle
